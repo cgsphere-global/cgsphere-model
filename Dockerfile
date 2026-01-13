@@ -24,4 +24,4 @@ RUN chmod +x start-application.sh
 
 EXPOSE 8000
 
-CMD ["bash", "./start-application.sh"]
+CMD ["/workspace/start-application.sh"]
