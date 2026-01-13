@@ -17,9 +17,10 @@ RUN pip install --no-cache-dir -r requirements.txt uvicorn
 
 COPY . .
 
-RUN sed -i 's/\r$//' start-application.sh \
-    && chmod +x start-application.sh
+COPY start-application.sh /start-application.sh
+
+RUN chmod +x /start-application.sh
 
 EXPOSE 8000
 
-CMD ["/bin/bash", "-c", "if [ -f /workspace/start-application.sh ]; then exec /workspace/start-application.sh; elif [ -f /start-application.sh ]; then exec /start-application.sh; else echo 'Warning: start-application.sh not found, starting server directly...'; exec uvicorn application:app --host 0.0.0.0 --port 8000; fi"]
+ENTRYPOINT ["/start-application.sh"]
