@@ -8,6 +8,7 @@ WORKDIR /workspace
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
+    bash \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -19,4 +20,4 @@ RUN chmod +x start-application.sh
 
 EXPOSE 8000
 
-CMD ["./start-application.sh"]
+CMD ["bash", "./start-application.sh"]
