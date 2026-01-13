@@ -22,4 +22,4 @@ RUN sed -i 's/\r$//' start-application.sh \
 
 EXPOSE 8000
 
-CMD ["/workspace/start-application.sh"]
+CMD ["/bin/bash", "-c", "if [ -f /workspace/start-application.sh ]; then exec /workspace/start-application.sh; elif [ -f /start-application.sh ]; then exec /start-application.sh; else echo 'Warning: start-application.sh not found, starting server directly...'; exec uvicorn application:app --host 0.0.0.0 --port 8000; fi"]
