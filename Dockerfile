@@ -14,7 +14,11 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN pip install uvicorn
+
 COPY . .
+
+RUN sed -i 's/\r$//' start-application.sh
 
 RUN chmod +x start-application.sh
 
