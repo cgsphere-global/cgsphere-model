@@ -68,7 +68,7 @@ FLIP_LABELS = os.getenv("FLIP_LABELS", "1").strip() not in {"0", "false", "False
 AGAINST_LABEL = 0
 FOR_LABEL = 1
 
-MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "10"))
+MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "10000"))
 
 
 logger.info(f"AGAINST_THRESHOLD: {AGAINST_THRESHOLD}")
