@@ -443,6 +443,99 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
 
+def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]:
+    """Send all against reasons to ChatGPT and have it select the top 5 most compelling ones."""
+    if client is None or not against_reasons:
+        return None
+    
+    if len(against_reasons) <= 5:
+        # If 5 or fewer, just return all of them
+        return against_reasons
+    
+    # Format all reasons for ChatGPT
+    formatted_reasons = "\n\n".join([f"{i}. {reason}" for i, reason in enumerate(against_reasons, 1)])
+    
+    prompt = (
+        "You are analyzing reasons why investors might vote AGAINST a corporate resolution. "
+        "Below are all the reasons provided:\n\n"
+        + formatted_reasons
+        + "\n\n"
+        "Please select the top 5 most compelling and important reasons for voting AGAINST. "
+        "Consider factors like:\n"
+        "- The strength and specificity of the reasoning\n"
+        "- The relevance to governance best practices\n"
+        "- The clarity and persuasiveness of the argument\n"
+        "- The significance of the concerns raised\n\n"
+        "Return your response as a JSON object with a 'reasons' key containing an array of exactly 5 strings (or fewer if there are fewer than 5 total reasons). "
+        "Each string should be one of the reasons from the list above, copied exactly. "
+        "Return ONLY valid JSON, no other text. Example format: {\"reasons\": [\"reason 1\", \"reason 2\", \"reason 3\", \"reason 4\", \"reason 5\"]}"
+    )
+    
+    try:
+        t0 = time.time()
+        # Try with JSON mode if supported (gpt-4o and newer)
+        use_json_mode = OPENAI_MODEL.startswith("gpt-4o") or "gpt-4-turbo" in OPENAI_MODEL
+        try:
+            if use_json_mode:
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are an expert in corporate governance and ESG voting. You always return valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+            else:
+                response = client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": "You are an expert in corporate governance and ESG voting. You always return valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+        except Exception as e:
+            # If JSON mode fails, try without it
+            logger.warning(f"JSON mode failed, trying without: {e}")
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert in corporate governance and ESG voting. You always return valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+        
+        logger.info(f"GPT top-5 selection took {time.time() - t0:.2f}s")
+        
+        content = response.choices[0].message.content.strip()
+        
+        # Clean up content - remove markdown code blocks if present
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
+            if content.startswith("json"):
+                content = content[4:].strip()
+        
+        # Try to parse JSON
+        try:
+            parsed = json.loads(content)
+            # If it's wrapped in an object, try to find an array
+            if isinstance(parsed, dict):
+                # Look for common keys that might contain the array
+                for key in ["reasons", "top_5", "results", "data", "items"]:
+                    if key in parsed and isinstance(parsed[key], list):
+                        return parsed[key][:5]  # Ensure max 5
+                return None
+            elif isinstance(parsed, list):
+                return parsed[:5]  # Ensure max 5
+            else:
+                return None
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse GPT response as JSON: {content[:200]}")
+            return None
+    except Exception as e:
+        logger.error(f"Error getting top 5 from GPT: {e}")
+        return None
+
 def stream_gpt_reason(policy_text: str, chunks: List[str]):
     if client is None:
         yield "(GPT disabled: no API key)"
@@ -776,6 +869,8 @@ async def analyze_document_stream(
         yield json.dumps({"type": "meta", "data": meta}) + "\n"
 
         t_stream_start = time.time()
+        against_reasons = []  # Collect all AGAINST reason texts only
+        
         for inv in investor_list:
             pol_text = investor_policies[inv]
             force_reason = inv in csv_force_reason_investors
@@ -794,7 +889,9 @@ async def analyze_document_stream(
 
             if base["verdict"] == "AGAINST":
                 yield json.dumps({"type": "reason-start", "investor": inv}) + "\n"
+                reason_tokens = []
                 for token in stream_gpt_reason(pol_text, top_chunks):
+                    reason_tokens.append(token)
                     yield json.dumps(
                         {
                             "type": "reason-chunk",
@@ -802,9 +899,23 @@ async def analyze_document_stream(
                             "token": token,
                         }
                     ) + "\n"
+                full_reason = "".join(reason_tokens)
                 yield json.dumps({"type": "reason-end", "investor": inv}) + "\n"
+                
+                # Collect just the reason text for top 5 ranking
+                against_reasons.append(full_reason)
 
         logger.info(f"Streaming loop finished in {time.time() - t_stream_start:.4f}s")
+        
+        # Get top 5 against reasons from ChatGPT
+        if against_reasons:
+            top_5_reasons = get_top_5_against_reasons(against_reasons)
+            if top_5_reasons:
+                yield json.dumps({"type": "top-5-against", "data": top_5_reasons}) + "\n"
+            else:
+                # Fallback: if GPT fails, just return first 5
+                yield json.dumps({"type": "top-5-against", "data": against_reasons[:5]}) + "\n"
+        
         logger.info(f"Total streaming request took {time.time() - t_req_start:.4f}s")
         yield json.dumps({"type": "done"}) + "\n"
 
