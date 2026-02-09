@@ -115,8 +115,13 @@ logger.info(f"FLIP_LABELS: {FLIP_LABELS}")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 logger.info(f"OpenAI client ready: {bool(client)}")
 
-DATA_DIR = ""
-DF_PATH = os.getenv("POLICY_CSV", f"{DATA_DIR}/investor_rem_policies.csv")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DF_PATH = os.getenv(
+    "POLICY_CSV",
+    os.path.join(BASE_DIR, "investor_rem_policies.csv")
+)
+
 df = pd.read_csv(DF_PATH)
 investor_policies: Dict[str, str] = dict(zip(df["Investor"], df["RemunerationPolicy"]))
 
