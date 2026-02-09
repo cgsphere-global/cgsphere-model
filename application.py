@@ -126,10 +126,22 @@ df = pd.read_csv(DF_PATH)
 investor_policies: Dict[str, str] = dict(zip(df["Investor"], df["RemunerationPolicy"]))
 
 CSV_MAP = {
-    "autotrader": os.getenv("AUTOTRADER_CSV", f"{DATA_DIR}/autotrader_against_votes.csv"),
-    "unilever": os.getenv("UNILEVER_CSV", f"{DATA_DIR}/unilever_against_votes.csv"),
-    "sainsbury": os.getenv("SAINSBURY_CSV", f"{DATA_DIR}/sainsbury_against_votes.csv"),
-    "leg": os.getenv("LEG_CSV", f"{DATA_DIR}/leg_against_votes.csv"),
+    "autotrader": os.getenv(
+        "AUTOTRADER_CSV",
+        os.path.join(BASE_DIR, "autotrader_against_votes.csv"),
+    ),
+    "unilever": os.getenv(
+        "UNILEVER_CSV",
+        os.path.join(BASE_DIR, "unilever_against_votes.csv"),
+    ),
+    "sainsbury": os.getenv(
+        "SAINSBURY_CSV",
+        os.path.join(BASE_DIR, "sainsbury_against_votes.csv"),
+    ),
+    "leg": os.getenv(
+        "LEG_CSV",
+        os.path.join(BASE_DIR, "leg_against_votes.csv"),
+    ),
 }
 
 def _tokenize_name(s: str) -> List[str]:
