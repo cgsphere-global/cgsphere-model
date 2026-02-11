@@ -477,15 +477,17 @@ def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]
         "Below are all the reasons provided:\n\n"
         + formatted_reasons
         + "\n\n"
-        "Please select the top 5 most compelling and important reasons for voting AGAINST. "
+        "Please select the top 5 most compelling and important reasons for voting AGAINST, and rewrite each as a short, clear summary. "
         "Consider factors like:\n"
         "- The strength and specificity of the reasoning\n"
         "- The relevance to governance best practices\n"
         "- The clarity and persuasiveness of the argument\n"
         "- The significance of the concerns raised\n\n"
-        "Return your response as a JSON object with a 'reasons' key containing an array of exactly 5 strings (or fewer if there are fewer than 5 total reasons). "
-        "Each string should be one of the reasons from the list above, copied exactly. "
-        "Return ONLY valid JSON, no other text. Example format: {\"reasons\": [\"reason 1\", \"reason 2\", \"reason 3\", \"reason 4\", \"reason 5\"]}"
+        "Return your response as a JSON object with a 'reasons' key containing an array of exactly 5 strings "
+        "(or fewer if there are fewer than 5 total reasons). "
+        "Each string should be a concise paraphrase of one of the original reasons, around 20 words (maximum 25), "
+        "focusing only on the core concern (no investor names, no numbering, no extra commentary). "
+        "Return ONLY valid JSON, no other text. Example format: {\"reasons\": [\"short reason 1\", \"short reason 2\", \"short reason 3\", \"short reason 4\", \"short reason 5\"]}"
     )
     
     try:
