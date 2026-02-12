@@ -6,7 +6,7 @@ import sys
 
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 import os
 import html
@@ -19,6 +19,7 @@ import docx
 import re
 from typing import Optional, Set, Dict, List
 import json
+import asyncpg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +56,7 @@ USERNAME = os.getenv("APP_USERNAME", "JayminShah")
 PASSWORD = os.getenv("APP_PASSWORD", "Password1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://cgspherestage:cgsphere123@cg-sphere-global-stag.c9aom6cm8vaq.ap-south-1.rds.amazonaws.com:5432/postgres?sslmode=require")
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 CLS_MODEL_NAME = os.getenv("CLS_MODEL_NAME", "Jaymin123321/Rem-Classifier")
@@ -262,6 +264,30 @@ with torch.no_grad():
         for name, vec in zip(names, vecs):
             INVESTOR_EMBS[name] = vec
 logger.info(f"Cached {len(INVESTOR_EMBS)} investor policies.")
+
+db_pool = None
+
+async def get_db_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    return db_pool
+
+async def fetch_investors_by_ids(investor_ids: List[str]) -> Dict[str, Dict[str, str]]:
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, \"investorName\", \"investorCode\" FROM investor_masters WHERE id = ANY($1::uuid[])",
+            investor_ids
+        )
+    investors = {}
+    for row in rows:
+        investors[str(row['id'])] = {
+            'id': str(row['id']),
+            'investorName': row['investorName'],
+            'investorCode': row['investorCode']
+        }
+    return investors
 
 app = FastAPI()
 
@@ -821,25 +847,27 @@ async def analyze_document_stream(
         elif filename.endswith(".pdf"):
             full_text = extract_text_from_pdf_bytes(contents)
         else:
-            return {
-                "error": f"Unsupported file type: {filename}. Please upload .docx or .pdf.",
-            }
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Unsupported file type: {filename}. Please upload .docx or .pdf."}
+            )
         logger.info(f"Text extraction took {time.time() - t0:.4f}s")
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
-        return {
-            "error": f"Error extracting text: {str(e)}",
-        }
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Error extracting text: {str(e)}"}
+        )
 
     if not full_text.strip():
-        return {"error": "No readable text found in document."}
+        return JSONResponse(status_code=400, content={"error": "No readable text found in document."})
 
     t0 = time.time()
     chunks = chunk_text(full_text)
     logger.info(f"Chunking took {time.time() - t0:.4f}s, created {len(chunks)} chunks")
 
     if not chunks:
-        return {"error": "Document is too short to chunk."}
+        return JSONResponse(status_code=400, content={"error": "Document is too short to chunk."})
 
     original_num_chunks = len(chunks)
     if len(chunks) > MAX_CHUNKS:
@@ -849,32 +877,63 @@ async def analyze_document_stream(
     chunk_embeddings = get_embeddings(chunks, batch_size=32)
     logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
+    investor_list = []
+    investor_objects = {}
+
     if not policies or policies.lower() == "all":
         investor_list = list(investor_policies.keys())
+        for inv_name in investor_list:
+            investor_objects[inv_name] = {
+                'id': None,
+                'investorName': inv_name,
+                'investorCode': None
+            }
     else:
-        requested_raw = [p.strip() for p in policies.split("@") if p.strip()]
-
-        normalized_map = {normalize_name(k): k for k in investor_policies.keys()}
-
-        investor_list = []
-        unknown = []
-
-        for req in requested_raw:
-            key = normalize_name(req)
-
-            if key in normalized_map:
-                investor_list.append(normalized_map[key])
-                continue
-
-            matches = [full for norm, full in normalized_map.items() if norm.startswith(key)]
-            if matches:
-                investor_list.append(matches[0])
-                continue
-
-            unknown.append(req)
-
-        if unknown:
-            return {"error": f"Unknown investor(s): {', '.join(unknown)}"}
+        requested_ids = [p.strip() for p in policies.split("@") if p.strip()]
+        
+        try:
+            t0 = time.time()
+            db_investors = await fetch_investors_by_ids(requested_ids)
+            logger.info(f"Database fetch took {time.time() - t0:.4f}s")
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "investor not found"}
+            )
+        
+        missing_ids = [inv_id for inv_id in requested_ids if inv_id not in db_investors]
+        if missing_ids:
+            logger.warning(f"Investors not found in database: {missing_ids}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "investor not found"}
+            )
+        
+        normalized_policy_map = {normalize_name(k): k for k in investor_policies.keys()}
+        
+        for inv_id, inv_data in db_investors.items():
+            inv_name = inv_data['investorName']
+            normalized_inv_name = normalize_name(inv_name)
+            
+            matched_policy_name = None
+            if normalized_inv_name in normalized_policy_map:
+                matched_policy_name = normalized_policy_map[normalized_inv_name]
+            else:
+                for norm_policy, policy_name in normalized_policy_map.items():
+                    if normalized_inv_name in norm_policy or norm_policy in normalized_inv_name:
+                        matched_policy_name = policy_name
+                        break
+            
+            if not matched_policy_name:
+                logger.warning(f"Investor '{inv_name}' from database does not match any policy")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "investor not found"}
+                )
+            
+            investor_list.append(matched_policy_name)
+            investor_objects[matched_policy_name] = inv_data
 
     def iter_results():
         meta = {
@@ -883,12 +942,12 @@ async def analyze_document_stream(
             "num_chunks_used": len(chunks),
             "max_chunks_cap": MAX_CHUNKS,
             "policies": policies,
-            "investors": investor_list,
+            "investors": [investor_objects[inv] for inv in investor_list],
         }
         yield json.dumps({"type": "meta", "data": meta}) + "\n"
 
         t_stream_start = time.time()
-        against_reasons = []  # Collect all AGAINST reason texts only
+        against_reasons = []
         
         for inv in investor_list:
             pol_text = investor_policies[inv]
@@ -903,25 +962,26 @@ async def analyze_document_stream(
             )
 
             data_without_reason = dict(base)
+            data_without_reason["investor"] = investor_objects[inv]
             data_without_reason["reason"] = None
             yield json.dumps({"type": "result", "data": data_without_reason}) + "\n"
 
             if base["verdict"] == "AGAINST":
-                yield json.dumps({"type": "reason-start", "investor": inv}) + "\n"
+                inv_obj = investor_objects[inv]
+                yield json.dumps({"type": "reason-start", "investor": inv_obj}) + "\n"
                 reason_tokens = []
                 for token in stream_gpt_reason(pol_text, top_chunks):
                     reason_tokens.append(token)
                     yield json.dumps(
                         {
                             "type": "reason-chunk",
-                            "investor": inv,
+                            "investor": inv_obj,
                             "token": token,
                         }
                     ) + "\n"
                 full_reason = "".join(reason_tokens)
-                yield json.dumps({"type": "reason-end", "investor": inv}) + "\n"
+                yield json.dumps({"type": "reason-end", "investor": inv_obj}) + "\n"
                 
-                # Collect just the reason text for top 5 ranking
                 against_reasons.append(full_reason)
 
         logger.info(f"Streaming loop finished in {time.time() - t_stream_start:.4f}s")

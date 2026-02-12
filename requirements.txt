@@ -18,3 +18,4 @@ tqdm
 accelerate
 python-multipart
 scikit-learn
+asyncpg
