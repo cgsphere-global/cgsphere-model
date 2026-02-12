@@ -562,9 +562,13 @@ def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]
             if content.startswith("json"):
                 content = content[4:].strip()
         
+        logger.info(f"[TOP5] Cleaned response length: {len(content)}")
+
         # Try to parse JSON
         try:
             parsed = json.loads(content)
+            logger.info(f"[TOP5] Parsed JSON type: {type(parsed)}")
+
             # If it's wrapped in an object, try to find an array
             if isinstance(parsed, dict):
                 # Look for common keys that might contain the array
