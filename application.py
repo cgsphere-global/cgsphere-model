@@ -497,23 +497,25 @@ def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]
     
     # Format all reasons for ChatGPT
     formatted_reasons = "\n\n".join([f"{i}. {reason}" for i, reason in enumerate(against_reasons, 1)])
-    
+
     prompt = (
-        "You are analyzing reasons why investors might vote AGAINST a corporate resolution. "
         "Below are all the reasons provided:\n\n"
-        + formatted_reasons
-        + "\n\n"
-        "Please select the top 5 most compelling and important reasons for voting AGAINST, and rewrite each as a short, clear summary. "
-        "Consider factors like:\n"
-        "- The strength and specificity of the reasoning\n"
-        "- The relevance to governance best practices\n"
-        "- The clarity and persuasiveness of the argument\n"
-        "- The significance of the concerns raised\n\n"
-        "Return your response as a JSON object with a 'reasons' key containing an array of exactly 5 strings "
-        "(or fewer if there are fewer than 5 total reasons). "
-        "Each string should be a concise paraphrase of one of the original reasons, around 20 words (maximum 25), "
-        "focusing only on the core concern (no investor names, no numbering, no extra commentary). "
-        "Return ONLY valid JSON, no other text. Example format: {\"reasons\": [\"short reason 1\", \"short reason 2\", \"short reason 3\", \"short reason 4\", \"short reason 5\"]}"
+        f"{formatted_reasons}\n\n"
+        "Select the 5 most compelling and important reasons for voting AGAINST.\n\n"
+        "Rewrite each selected reason as a very concise summary (maximum 12 words each).\n"
+        "Focus only on the core concern.\n"
+        "No investor names.\n"
+        "No numbering.\n"
+        "No extra commentary.\n\n"
+        "Return ONLY a valid JSON array of exactly 5 strings in this format:\n"
+        "[\n"
+        '  "reason-1-text",\n'
+        '  "reason-2-text",\n'
+        '  "reason-3-text",\n'
+        '  "reason-4-text",\n'
+        '  "reason-5-text"\n'
+        "]\n\n"
+        "Do not return any explanation or additional text."
     )
     
     try:
