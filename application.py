@@ -1003,7 +1003,7 @@ async def analyze_document_stream(
                 
                 against_reasons.append(full_reason)
 
-        logger.info(f"Streaming loop finished in {time.time() - t_stream_start:.4f}s")
+        logger.info(f"New Changes; Streaming loop finished in {time.time() - t_stream_start:.4f}s")
         
         # Get top 5 against reasons from ChatGPT
         if against_reasons:
