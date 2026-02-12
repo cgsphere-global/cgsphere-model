@@ -491,8 +491,11 @@ def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]
     if client is None or not against_reasons:
         return None
     
+    logger.info(f"[TOP5] Processing {len(against_reasons)} reasons")
+    
     if len(against_reasons) <= 5:
         # If 5 or fewer, just return all of them
+        logger.info(f"[TOP5] <= 5 reasons, returning all {len(against_reasons)}")
         return against_reasons
     
     # Format all reasons for ChatGPT
@@ -1004,10 +1007,13 @@ async def analyze_document_stream(
         
         # Get top 5 against reasons from ChatGPT
         if against_reasons:
+            logger.info(f"Starting top 5 reasons generation for {len(against_reasons)} reasons")
             top_5_reasons = get_top_5_against_reasons(against_reasons)
             if top_5_reasons:
+                logger.info(f"Successfully generated {len(top_5_reasons)} top reasons")
                 yield json.dumps({"type": "top-5-against", "data": top_5_reasons}) + "\n"
             else:
+                logger.warning("Failed to generate top 5 reasons, falling back to first 5")
                 # Fallback: if GPT fails, just return first 5
                 yield json.dumps({"type": "top-5-against", "data": against_reasons[:5]}) + "\n"
         
