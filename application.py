@@ -499,23 +499,33 @@ def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]
     formatted_reasons = "\n\n".join([f"{i}. {reason}" for i, reason in enumerate(against_reasons, 1)])
 
     prompt = (
-        "Below are all the reasons provided:\n\n"
+        "Below is a list of reasons for voting AGAINST:\n\n"
         f"{formatted_reasons}\n\n"
-        "Select the 5 most compelling and important reasons for voting AGAINST.\n\n"
-        "Rewrite each selected reason as a very concise summary (maximum 12 words each).\n"
-        "Focus only on the core concern.\n"
-        "No investor names.\n"
-        "No numbering.\n"
-        "No extra commentary.\n\n"
-        "Return ONLY a valid JSON array of exactly 5 strings in this format:\n"
+        "TASK:\n"
+        "1. Select the 5 strongest reasons.\n"
+        "2. Rewrite each as a VERY SHORT summary (maximum 10 words).\n\n"
+        "RULES:\n"
+        "- Each reason MUST be 5–10 words only.\n"
+        "- No names (no BlackRock, no company names).\n"
+        "- No explanations.\n"
+        "- No numbering.\n"
+        "- No bullet points.\n"
+        "- No markdown.\n"
+        "- No introductory text.\n"
+        "- No analysis.\n\n"
+        "OUTPUT FORMAT:\n"
+        "Return ONLY a valid JSON array of exactly 5 strings.\n"
+        "Do NOT wrap it inside an object.\n"
+        "Do NOT include keys like 'type' or 'data'.\n\n"
+        "Correct format example:\n"
         "[\n"
-        '  "reason-1-text",\n'
-        '  "reason-2-text",\n'
-        '  "reason-3-text",\n'
-        '  "reason-4-text",\n'
-        '  "reason-5-text"\n'
+        '  "Misaligned executive pay structure",\n'
+        '  "Poor performance linkage",\n'
+        '  "Excessive discretionary bonuses",\n'
+        '  "Weak disclosure transparency",\n'
+        '  "Short-term incentive focus"\n'
         "]\n\n"
-        "Do not return any explanation or additional text."
+        "If you add anything outside the JSON array, your answer is invalid."
     )
     
     try:
