@@ -493,80 +493,54 @@ def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]
     
     logger.info(f"[TOP5] Processing {len(against_reasons)} reasons")
     
-    if len(against_reasons) <= 5:
-        # If 5 or fewer, just return all of them
-        logger.info(f"[TOP5] <= 5 reasons, returning all {len(against_reasons)}")
-        return against_reasons
+     # Always send to GPT to get concise summaries, even if <= 5 reasons
     
     # Format all reasons for ChatGPT
     formatted_reasons = "\n\n".join([f"{i}. {reason}" for i, reason in enumerate(against_reasons, 1)])
 
+    num_reasons_to_return = min(5, len(against_reasons))
     prompt = (
-        "Below is a list of reasons for voting AGAINST:\n\n"
+        "Below is a list of reasons why investors voted AGAINST a corporate resolution:\n\n"
         f"{formatted_reasons}\n\n"
         "TASK:\n"
-        "1. Select the 5 strongest reasons.\n"
-        "2. Rewrite each as a VERY SHORT summary (maximum 10 words).\n\n"
+        f"Analyze ALL the reasons above and identify the {num_reasons_to_return} most important and compelling concerns that apply across all investors.\n"
+        "Then create a VERY CONCISE summary for each (5-10 words maximum).\n\n"
         "RULES:\n"
-        "- Each reason MUST be 5–10 words only.\n"
-        "- No names (no BlackRock, no company names).\n"
-        "- No explanations.\n"
-        "- No numbering.\n"
-        "- No bullet points.\n"
-        "- No markdown.\n"
-        "- No introductory text.\n"
-        "- No analysis.\n\n"
+        "- Each summary MUST be 5-10 words only\n"
+        "- No investor names, no company names\n"
+        "- No explanations or analysis\n"
+        "- Focus on the core concern only\n"
+        "- Make it a standalone statement\n\n"
         "OUTPUT FORMAT:\n"
-        "Return ONLY a valid JSON array of exactly 5 strings.\n"
-        "Do NOT wrap it inside an object.\n"
-        "Do NOT include keys like 'type' or 'data'.\n\n"
-        "Correct format example:\n"
-        "[\n"
-        '  "Misaligned executive pay structure",\n'
-        '  "Poor performance linkage",\n'
-        '  "Excessive discretionary bonuses",\n'
-        '  "Weak disclosure transparency",\n'
-        '  "Short-term incentive focus"\n'
-        "]\n\n"
-        "If you add anything outside the JSON array, your answer is invalid."
+        f"You MUST return ONLY a valid JSON array with exactly {num_reasons_to_return} string elements.\n"
+        "Start your response with [ and end with ].\n"
+        "Do NOT include any text before the opening bracket or after the closing bracket.\n"
+        "Do NOT wrap it in an object.\n"
+        "Do NOT include markdown code blocks.\n"
+        "Do NOT include explanations.\n\n"
+        f"Example format (copy this structure exactly):\n"
+        '["Misaligned executive pay structure", "Poor performance linkage", "Excessive discretionary bonuses", "Weak disclosure transparency", "Short-term incentive focus"]\n\n'
+        "Your response should start with [ and contain only the JSON array."
     )
     
     try:
         t0 = time.time()
-        # Try with JSON mode if supported (gpt-4o and newer)
-        use_json_mode = OPENAI_MODEL.startswith("gpt-4o") or "gpt-4-turbo" in OPENAI_MODEL
-        try:
-            if use_json_mode:
-                response = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are an expert in corporate governance and ESG voting. You always return valid JSON."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are an expert in corporate governance and ESG voting. You always return valid JSON."},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-        except Exception as e:
-            # If JSON mode fails, try without it
-            logger.warning(f"JSON mode failed, trying without: {e}")
-            response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are an expert in corporate governance and ESG voting. You always return valid JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-            )
+        # Don't use JSON mode since we need an array, not an object
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are an expert in corporate governance. You MUST respond with ONLY a valid JSON array. Start with [ and end with ]. No other text, no explanations, no markdown, no code blocks."
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
         
         logger.info(f"GPT top-5 selection took {time.time() - t0:.2f}s")
         
         content = response.choices[0].message.content.strip()
+        logger.info(f"[TOP5] Raw GPT response (first 500 chars): {content[:500]}")
         
         # Clean up content - remove markdown code blocks if present
         if content.startswith("```"):
@@ -574,27 +548,74 @@ def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]
             content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
             if content.startswith("json"):
                 content = content[4:].strip()
+            logger.info(f"[TOP5] After removing markdown: {content[:500]}")
         
-        logger.info(f"[TOP5] Cleaned response length: {len(content)}")
-
-        # Try to parse JSON
+        # Try multiple strategies to extract the JSON array
+        
+        # Strategy 1: Try parsing the content directly
+        parsed = None
         try:
             parsed = json.loads(content)
-            logger.info(f"[TOP5] Parsed JSON type: {type(parsed)}")
+            logger.info(f"[TOP5] Direct parse succeeded, type: {type(parsed)}")
+        except json.JSONDecodeError as e:
+            logger.info(f"[TOP5] Direct parse failed: {e}")
+            
+            # Strategy 2: Try to find JSON array using balanced bracket matching
+            bracket_count = 0
+            start_idx = -1
+            for i, char in enumerate(content):
+                if char == '[':
+                    if bracket_count == 0:
+                        start_idx = i
+                    bracket_count += 1
+                elif char == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0 and start_idx != -1:
+                        # Found a complete array
+                        array_content = content[start_idx:i+1]
+                        logger.info(f"[TOP5] Extracted array using bracket matching: {array_content[:200]}")
+                        try:
+                            parsed = json.loads(array_content)
+                            logger.info(f"[TOP5] Bracket-matched parse succeeded")
+                            break
+                        except json.JSONDecodeError as e2:
+                            logger.info(f"[TOP5] Bracket-matched parse failed: {e2}")
+                            continue
+            
+            # Strategy 3: Try regex to find array (more lenient)
+            if parsed is None:
+                # Match from first [ to last ] (greedy)
+                array_match = re.search(r'\[.*\]', content, re.DOTALL)
+                if array_match:
+                    array_content = array_match.group(0)
+                    logger.info(f"[TOP5] Extracted array using regex: {array_content[:200]}")
+                    try:
+                        parsed = json.loads(array_content)
+                        logger.info(f"[TOP5] Regex-matched parse succeeded")
+                    except json.JSONDecodeError as e3:
+                        logger.info(f"[TOP5] Regex-matched parse failed: {e3}")
+        
+        # Process the parsed result
+        if parsed is None:
+            logger.error(f"[TOP5] All parsing strategies failed. Full content: {content}")
+            return None
 
-            # If it's wrapped in an object, try to find an array
-            if isinstance(parsed, dict):
-                # Look for common keys that might contain the array
-                for key in ["reasons", "top_5", "results", "data", "items"]:
-                    if key in parsed and isinstance(parsed[key], list):
-                        return parsed[key][:5]  # Ensure max 5
-                return None
-            elif isinstance(parsed, list):
-                return parsed[:5]  # Ensure max 5
-            else:
-                return None
-        except json.JSONDecodeError:
-            logger.error(f"Failed to parse GPT response as JSON: {content[:200]}")
+        # If it's wrapped in an object, try to find an array
+        if isinstance(parsed, dict):
+            # Look for common keys that might contain the array
+            for key in ["reasons", "top_5", "results", "data", "items", "top5", "reasons_list"]:
+                if key in parsed and isinstance(parsed[key], list):
+                    result = parsed[key][:5]
+                    logger.info(f"[TOP5] Found array in dict key '{key}', returning {len(result)} items")
+                    return result
+            logger.warning(f"[TOP5] Found dict but no array key. Keys: {list(parsed.keys())}")
+            return None
+        elif isinstance(parsed, list):
+            result = parsed[:5]  # Ensure max 5
+            logger.info(f"[TOP5] Found direct array with {len(parsed)} items, returning {len(result)} items")
+            return result
+        else:
+            logger.warning(f"[TOP5] Parsed JSON is neither dict nor list: {type(parsed)}, value: {parsed}")
             return None
     except Exception as e:
         logger.error(f"Error getting top 5 from GPT: {e}")
