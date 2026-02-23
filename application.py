@@ -379,24 +379,44 @@ def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
     if not chunks:
         return []
 
-    # Use the tokenizer's supported "pair" encoding API. This is more robust across
-    # Transformers versions than calling internal helper methods like
-    # `build_inputs_with_special_tokens`.
-    enc = cls_tokenizer(
-        [policy] * len(chunks),
-        chunks,
-        truncation=True,
-        padding=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
+    p = cls_tokenizer(policy, truncation=True, max_length=max_length // 2, add_special_tokens=False)
+    policy_ids = p["input_ids"]
 
-    # Some model/tokenizer combos (e.g., RoBERTa) don't use token_type_ids.
-    if "token_type_ids" not in enc:
-        enc["token_type_ids"] = torch.zeros_like(enc["input_ids"])
+    all_input_ids = []
+    all_token_type_ids = []
+    all_attention_masks = []
 
-    enc = {k: v.to(device) for k, v in enc.items()}
-    logits = classifier_model(**enc).logits
+    for chunk in chunks:
+        c = cls_tokenizer(chunk, truncation=True, max_length=max_length // 2, add_special_tokens=False)
+
+        ids = cls_tokenizer.build_inputs_with_special_tokens(policy_ids, c["input_ids"])
+        token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(policy_ids, c["input_ids"])
+
+        if len(ids) > max_length:
+            ids = ids[:max_length]
+            token_type_ids = token_type_ids[:max_length]
+
+        attention_mask = [1] * len(ids)
+
+        all_input_ids.append(ids)
+        all_token_type_ids.append(token_type_ids)
+        all_attention_masks.append(attention_mask)
+
+    max_len = max(len(ids) for ids in all_input_ids)
+
+    for i in range(len(all_input_ids)):
+        padding_length = max_len - len(all_input_ids[i])
+        all_input_ids[i] = all_input_ids[i] + [cls_tokenizer.pad_token_id] * padding_length
+        all_token_type_ids[i] = all_token_type_ids[i] + [0] * padding_length
+        all_attention_masks[i] = all_attention_masks[i] + [0] * padding_length
+
+    inputs = {
+        "input_ids": torch.tensor(all_input_ids, dtype=torch.long, device=device),
+        "attention_mask": torch.tensor(all_attention_masks, dtype=torch.long, device=device),
+        "token_type_ids": torch.tensor(all_token_type_ids, dtype=torch.long, device=device),
+    }
+
+    logits = classifier_model(**inputs).logits
 
     results = []
 
