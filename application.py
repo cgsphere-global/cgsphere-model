@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassific
 from openai import OpenAI
 import docx
 import re
-from typing import Optional, Set, Dict, List
+from typing import Optional, Set, Dict, List, TypedDict, cast
 import json
 import asyncpg
 
@@ -379,44 +379,24 @@ def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
     if not chunks:
         return []
 
-    p = cls_tokenizer(policy, truncation=True, max_length=max_length // 2, add_special_tokens=False)
-    policy_ids = p["input_ids"]
+    # Use the tokenizer's supported "pair" encoding API. This is more robust across
+    # Transformers versions than calling internal helper methods like
+    # `build_inputs_with_special_tokens`.
+    enc = cls_tokenizer(
+        [policy] * len(chunks),
+        chunks,
+        truncation=True,
+        padding=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
 
-    all_input_ids = []
-    all_token_type_ids = []
-    all_attention_masks = []
+    # Some model/tokenizer combos (e.g., RoBERTa) don't use token_type_ids.
+    if "token_type_ids" not in enc:
+        enc["token_type_ids"] = torch.zeros_like(enc["input_ids"])
 
-    for chunk in chunks:
-        c = cls_tokenizer(chunk, truncation=True, max_length=max_length // 2, add_special_tokens=False)
-
-        ids = cls_tokenizer.build_inputs_with_special_tokens(policy_ids, c["input_ids"])
-        token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(policy_ids, c["input_ids"])
-
-        if len(ids) > max_length:
-            ids = ids[:max_length]
-            token_type_ids = token_type_ids[:max_length]
-
-        attention_mask = [1] * len(ids)
-
-        all_input_ids.append(ids)
-        all_token_type_ids.append(token_type_ids)
-        all_attention_masks.append(attention_mask)
-
-    max_len = max(len(ids) for ids in all_input_ids)
-
-    for i in range(len(all_input_ids)):
-        padding_length = max_len - len(all_input_ids[i])
-        all_input_ids[i] = all_input_ids[i] + [cls_tokenizer.pad_token_id] * padding_length
-        all_token_type_ids[i] = all_token_type_ids[i] + [0] * padding_length
-        all_attention_masks[i] = all_attention_masks[i] + [0] * padding_length
-
-    inputs = {
-        "input_ids": torch.tensor(all_input_ids, dtype=torch.long, device=device),
-        "attention_mask": torch.tensor(all_attention_masks, dtype=torch.long, device=device),
-        "token_type_ids": torch.tensor(all_token_type_ids, dtype=torch.long, device=device),
-    }
-
-    logits = classifier_model(**inputs).logits
+    enc = {k: v.to(device) for k, v in enc.items()}
+    logits = classifier_model(**enc).logits
 
     results = []
 
@@ -486,137 +466,161 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
 
-def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]:
-    """Send all against reasons to ChatGPT and have it select the top 5 most compelling ones."""
+class Top5AgainstOutput(TypedDict):
+    count: int
+    reason1: str
+    exp1: str
+    reason2: str
+    exp2: str
+    reason3: str
+    exp3: str
+    reason4: str
+    exp4: str
+    reason5: str
+    exp5: str
+
+
+def build_top_5_against_fallback(against_reasons: List[str]) -> Top5AgainstOutput:
+    """Fallback builder when GPT is unavailable/fails.
+
+    Produces the same structured shape as Structured Outputs, using truncation heuristics.
+    """
+
+    def _clean(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip())
+
+    def _reason_short(s: str) -> str:
+        words = _clean(s).split(" ")
+        words = [w for w in words if w]
+        return " ".join(words[:10])[:120]
+
+    def _exp_short(s: str) -> str:
+        # Keep it readable, but bounded
+        return _clean(s)[:280]
+
+    count = min(5, len(against_reasons))
+    out: Top5AgainstOutput = {
+        "count": max(1, count) if against_reasons else 1,
+        "reason1": "",
+        "exp1": "",
+        "reason2": "",
+        "exp2": "",
+        "reason3": "",
+        "exp3": "",
+        "reason4": "",
+        "exp4": "",
+        "reason5": "",
+        "exp5": "",
+    }
+    for i in range(1, count + 1):
+        txt = against_reasons[i - 1]
+        out[f"reason{i}"] = _reason_short(txt)  # type: ignore[literal-required]
+        out[f"exp{i}"] = _exp_short(txt)  # type: ignore[literal-required]
+    return out
+
+
+def get_top_5_against_reasons(against_reasons: List[str], chunks: List[str]) -> Optional[Top5AgainstOutput]:
+    """Summarize investor AGAINST rationales into up to 5 concise reasons + short explanations.
+
+    Uses OpenAI Structured Outputs (JSON schema) to avoid brittle JSON parsing.
+    Includes specific references from the annual report in the explanations.
+    """
     if client is None or not against_reasons:
         return None
     
-    logger.info(f"[TOP5] Processing {len(against_reasons)} reasons")
+    logger.info(f"[TOP5] Processing {len(against_reasons)} reasons with {len(chunks)} report chunks")
     
-     # Always send to GPT to get concise summaries, even if <= 5 reasons
+    # Always send to GPT to get concise summaries, even if <= 5 reasons
     
     # Format all reasons for ChatGPT
     formatted_reasons = "\n\n".join([f"{i}. {reason}" for i, reason in enumerate(against_reasons, 1)])
+    
+    # Format relevant chunks from the annual report (limit to TOP_K to avoid token limits)
+    formatted_chunks = "\n\n".join([f"[Report Excerpt {i+1}]:\n{chunk}" for i, chunk in enumerate(chunks[:TOP_K])])
 
     num_reasons_to_return = min(5, len(against_reasons))
     prompt = (
         "Below is a list of reasons why investors voted AGAINST a corporate resolution:\n\n"
         f"{formatted_reasons}\n\n"
+        "RELEVANT EXCERPTS FROM THE COMPANY'S ANNUAL REPORT:\n\n"
+        f"{formatted_chunks}\n\n"
         "TASK:\n"
-        f"Analyze ALL the reasons above and identify the {num_reasons_to_return} most important and compelling concerns that apply across all investors.\n"
-        "Then create a VERY CONCISE summary for each (5-10 words maximum).\n\n"
+        f"- Identify the top {num_reasons_to_return} most important, cross-cutting concerns.\n"
+        "- For each, write:\n"
+        "  - a short reason (5–10 words)\n"
+        "  - a short explanation (1–2 sentences) that INCLUDES SPECIFIC DETAILS from the annual report excerpts above\n\n"
         "RULES:\n"
-        "- Each summary MUST be 5-10 words only\n"
         "- No investor names, no company names\n"
-        "- No explanations or analysis\n"
-        "- Focus on the core concern only\n"
-        "- Make it a standalone statement\n\n"
-        "OUTPUT FORMAT:\n"
-        f"You MUST return ONLY a valid JSON array with exactly {num_reasons_to_return} string elements.\n"
-        "Start your response with [ and end with ].\n"
-        "Do NOT include any text before the opening bracket or after the closing bracket.\n"
-        "Do NOT wrap it in an object.\n"
-        "Do NOT include markdown code blocks.\n"
-        "Do NOT include explanations.\n\n"
-        f"Example format (copy this structure exactly):\n"
-        '["Misaligned executive pay structure", "Poor performance linkage", "Excessive discretionary bonuses", "Weak disclosure transparency", "Short-term incentive focus"]\n\n'
-        "Your response should start with [ and contain only the JSON array."
+        "- Reasons must be standalone and non-overlapping\n"
+        "- Explanations MUST include specific facts, figures, or details from the annual report excerpts\n"
+        "- Reference specific report excerpts when possible (e.g., 'The report shows...', 'According to the disclosure...')\n"
+        "- If fewer than 5 reasons are warranted, set count accordingly and leave the remaining reason/exp fields as empty strings.\n"
     )
+
+    schema = {
+        "name": "top_5_against_reasons",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "count": {"type": "integer", "minimum": 1, "maximum": 5},
+                "reason1": {"type": "string"},
+                "exp1": {"type": "string"},
+                "reason2": {"type": "string"},
+                "exp2": {"type": "string"},
+                "reason3": {"type": "string"},
+                "exp3": {"type": "string"},
+                "reason4": {"type": "string"},
+                "exp4": {"type": "string"},
+                "reason5": {"type": "string"},
+                "exp5": {"type": "string"},
+            },
+            "required": [
+                "count",
+                "reason1",
+                "exp1",
+                "reason2",
+                "exp2",
+                "reason3",
+                "exp3",
+                "reason4",
+                "exp4",
+                "reason5",
+                "exp5",
+            ],
+        },
+    }
     
     try:
         t0 = time.time()
-        # Don't use JSON mode since we need an array, not an object
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are an expert in corporate governance. You MUST respond with ONLY a valid JSON array. Start with [ and end with ]. No other text, no explanations, no markdown, no code blocks."
+                    "content": "You are an expert in corporate governance and ESG voting."
                 },
                 {"role": "user", "content": prompt},
             ],
+            response_format={"type": "json_schema", "json_schema": schema},
+            temperature=0.2,
         )
         
         logger.info(f"GPT top-5 selection took {time.time() - t0:.2f}s")
         
-        content = response.choices[0].message.content.strip()
-        logger.info(f"[TOP5] Raw GPT response (first 500 chars): {content[:500]}")
-        
-        # Clean up content - remove markdown code blocks if present
-        if content.startswith("```"):
-            lines = content.split("\n")
-            content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
-            if content.startswith("json"):
-                content = content[4:].strip()
-            logger.info(f"[TOP5] After removing markdown: {content[:500]}")
-        
-        # Try multiple strategies to extract the JSON array
-        
-        # Strategy 1: Try parsing the content directly
-        parsed = None
-        try:
-            parsed = json.loads(content)
-            logger.info(f"[TOP5] Direct parse succeeded, type: {type(parsed)}")
-        except json.JSONDecodeError as e:
-            logger.info(f"[TOP5] Direct parse failed: {e}")
-            
-            # Strategy 2: Try to find JSON array using balanced bracket matching
-            bracket_count = 0
-            start_idx = -1
-            for i, char in enumerate(content):
-                if char == '[':
-                    if bracket_count == 0:
-                        start_idx = i
-                    bracket_count += 1
-                elif char == ']':
-                    bracket_count -= 1
-                    if bracket_count == 0 and start_idx != -1:
-                        # Found a complete array
-                        array_content = content[start_idx:i+1]
-                        logger.info(f"[TOP5] Extracted array using bracket matching: {array_content[:200]}")
-                        try:
-                            parsed = json.loads(array_content)
-                            logger.info(f"[TOP5] Bracket-matched parse succeeded")
-                            break
-                        except json.JSONDecodeError as e2:
-                            logger.info(f"[TOP5] Bracket-matched parse failed: {e2}")
-                            continue
-            
-            # Strategy 3: Try regex to find array (more lenient)
-            if parsed is None:
-                # Match from first [ to last ] (greedy)
-                array_match = re.search(r'\[.*\]', content, re.DOTALL)
-                if array_match:
-                    array_content = array_match.group(0)
-                    logger.info(f"[TOP5] Extracted array using regex: {array_content[:200]}")
-                    try:
-                        parsed = json.loads(array_content)
-                        logger.info(f"[TOP5] Regex-matched parse succeeded")
-                    except json.JSONDecodeError as e3:
-                        logger.info(f"[TOP5] Regex-matched parse failed: {e3}")
-        
-        # Process the parsed result
-        if parsed is None:
-            logger.error(f"[TOP5] All parsing strategies failed. Full content: {content}")
+        content = (response.choices[0].message.content or "").strip()
+        logger.info(f"[TOP5] Structured output (first 500 chars): {content[:500]}")
+
+        parsed = cast(Top5AgainstOutput, json.loads(content))
+
+        # Minimal sanity check (schema should already enforce this)
+        count = int(parsed.get("count", 0))
+        if count < 1 or count > 5:
+            logger.warning(f"[TOP5] Invalid count returned: {count}")
             return None
 
-        # If it's wrapped in an object, try to find an array
-        if isinstance(parsed, dict):
-            # Look for common keys that might contain the array
-            for key in ["reasons", "top_5", "results", "data", "items", "top5", "reasons_list"]:
-                if key in parsed and isinstance(parsed[key], list):
-                    result = parsed[key][:5]
-                    logger.info(f"[TOP5] Found array in dict key '{key}', returning {len(result)} items")
-                    return result
-            logger.warning(f"[TOP5] Found dict but no array key. Keys: {list(parsed.keys())}")
-            return None
-        elif isinstance(parsed, list):
-            result = parsed[:5]  # Ensure max 5
-            logger.info(f"[TOP5] Found direct array with {len(parsed)} items, returning {len(result)} items")
-            return result
-        else:
-            logger.warning(f"[TOP5] Parsed JSON is neither dict nor list: {type(parsed)}, value: {parsed}")
-            return None
+        return parsed
     except Exception as e:
         logger.error(f"Error getting top 5 from GPT: {e}")
         return None
@@ -988,6 +992,7 @@ async def analyze_document_stream(
 
         t_stream_start = time.time()
         against_reasons = []
+        relevant_chunks_set: Set[str] = set()  # Collect unique chunks from investors who voted AGAINST
         
         for inv in investor_list:
             pol_text = investor_policies[inv]
@@ -1007,6 +1012,9 @@ async def analyze_document_stream(
             yield json.dumps({"type": "result", "data": data_without_reason}) + "\n"
 
             if base["verdict"] == "AGAINST":
+                # Collect chunks from investors who voted AGAINST for use in top 5 reasons
+                relevant_chunks_set.update(top_chunks)
+                
                 inv_obj = investor_objects[inv]
                 yield json.dumps({"type": "reason-start", "investor": inv_obj}) + "\n"
                 reason_tokens = []
@@ -1029,14 +1037,17 @@ async def analyze_document_stream(
         # Get top 5 against reasons from ChatGPT
         if against_reasons:
             logger.info(f"Starting top 5 reasons generation for {len(against_reasons)} reasons")
-            top_5_reasons = get_top_5_against_reasons(against_reasons)
+            # Convert set to list and use relevant chunks from AGAINST votes, or fallback to all chunks
+            relevant_chunks_list = list(relevant_chunks_set) if relevant_chunks_set else chunks
+            top_5_reasons = get_top_5_against_reasons(against_reasons, relevant_chunks_list)
             if top_5_reasons:
-                logger.info(f"Successfully generated {len(top_5_reasons)} top reasons")
-                yield json.dumps({"type": "top-5-against", "data": top_5_reasons}) + "\n"
+                logger.info(f"Successfully generated top reasons (count={top_5_reasons.get('count')})")
+                # Output shape: [ { reason1, exp1, ... } ]
+                yield json.dumps({"type": "top-5-against", "data": [top_5_reasons]}) + "\n"
             else:
                 logger.warning("Failed to generate top 5 reasons, falling back to first 5")
-                # Fallback: if GPT fails, just return first 5
-                yield json.dumps({"type": "top-5-against", "data": against_reasons[:5]}) + "\n"
+                # Fallback: keep the same structured shape
+                yield json.dumps({"type": "top-5-against", "data": [build_top_5_against_fallback(against_reasons)]}) + "\n"
         
         logger.info(f"Total streaming request took {time.time() - t_req_start:.4f}s")
         yield json.dumps({"type": "done"}) + "\n"
