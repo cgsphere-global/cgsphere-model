@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 import os
 import html
-from io import BytesIO
+from io import BytesIO, StringIO
 import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
@@ -20,6 +20,10 @@ import re
 from typing import Optional, Set, Dict, List, TypedDict, cast
 import json
 import asyncpg
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +61,8 @@ PASSWORD = os.getenv("APP_PASSWORD", "Password1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://cgspherestage:cgsphere123@cg-sphere-global-stag.c9aom6cm8vaq.ap-south-1.rds.amazonaws.com:5432/postgres?sslmode=require")
+# External API endpoint for fetching priority investor CSV
+PRIORITY_INVESTOR_CSV_API_URL = os.getenv("PRIORITY_INVESTOR_CSV_API_URL", "")
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 CLS_MODEL_NAME = os.getenv("CLS_MODEL_NAME", "Jaymin123321/Rem-Classifier")
@@ -126,6 +132,74 @@ DF_PATH = os.getenv(
 
 df = pd.read_csv(DF_PATH)
 investor_policies: Dict[str, str] = dict(zip(df["Investor"], df["RemunerationPolicy"]))
+def _parse_priority_investor_names_from_csv_text(csv_text: str) -> List[str]:
+    """
+    Parse a CSV (provided as text) containing investor names and return
+    them in order. This is intended for CSVs fetched from an external API,
+    not from local files.
+
+    Strategy:
+    - Try to read as a full CSV with pandas
+    - Prefer the first object-typed column as the name column
+    - Fallback to the first column if necessary
+    - If pandas fails, fall back to treating each non-empty line as a name
+    """
+    text = (csv_text or "").strip()
+    if not text:
+        return []
+
+    try:
+        df_pri = pd.read_csv(StringIO(text))
+        if df_pri.empty:
+            return []
+
+        # Prefer any object-typed column as the name column
+        name_col = None
+        for col in df_pri.columns:
+            if df_pri[col].dtype == object:
+                name_col = col
+                break
+
+        if name_col is None:
+            name_col = df_pri.columns[0]
+
+        return df_pri[name_col].dropna().astype(str).tolist()
+    except Exception:
+        # Fallback: one investor name per non-empty line
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def build_top_priority_investor_set_from_csv(csv_text: str, fraction: float = 0.5) -> Set[str]:
+    """
+    Given CSV text of investor names (from an external API), build a set of
+    the top-N names, where N is `fraction` of the list length (default 50%),
+    with a minimum of 1 if any names are present.
+    """
+    names = _parse_priority_investor_names_from_csv_text(csv_text)
+    if not names:
+        return set()
+
+    cutoff = max(1, int(len(names) * fraction))
+    return set(names[:cutoff])
+
+
+async def fetch_priority_investor_csv_from_api(api_url: str, timeout: float = 10.0) -> Optional[str]:
+    """
+    Fetch CSV text from an external API endpoint. Returns the CSV text as a string,
+    or None if the fetch fails or httpx is not available.
+    """
+    if not api_url or not httpx:
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(api_url)
+            response.raise_for_status()
+            return response.text
+    except Exception as e:
+        logger.warning(f"Failed to fetch priority investor CSV from {api_url}: {e}")
+        return None
+
 
 CSV_MAP = {
     "autotrader": os.getenv(
@@ -379,24 +453,34 @@ def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
     if not chunks:
         return []
 
-    p = cls_tokenizer(policy, truncation=True, max_length=max_length // 2, add_special_tokens=False)
-    policy_ids = p["input_ids"]
-
     all_input_ids = []
     all_token_type_ids = []
     all_attention_masks = []
 
     for chunk in chunks:
-        c = cls_tokenizer(chunk, truncation=True, max_length=max_length // 2, add_special_tokens=False)
+        # Encode the (policy, chunk) pair directly. This is more robust across
+        # different tokenizer implementations than calling
+        # `build_inputs_with_special_tokens` manually, which may not be present.
+        encoded = cls_tokenizer(
+            policy,
+            chunk,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+        )
 
-        ids = cls_tokenizer.build_inputs_with_special_tokens(policy_ids, c["input_ids"])
-        token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(policy_ids, c["input_ids"])
+        ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+
+        # Some models/tokenizers may not provide token_type_ids; fall back to zeros.
+        token_type_ids = encoded.get("token_type_ids")
+        if token_type_ids is None:
+            token_type_ids = [0] * len(ids)
 
         if len(ids) > max_length:
             ids = ids[:max_length]
             token_type_ids = token_type_ids[:max_length]
-
-        attention_mask = [1] * len(ids)
+            attention_mask = attention_mask[:max_length]
 
         all_input_ids.append(ids)
         all_token_type_ids.append(token_type_ids)
@@ -999,6 +1083,27 @@ async def analyze_document_stream(
             investor_list.append(matched_policy_name)
             investor_objects[matched_policy_name] = inv_data
 
+    # Automatically fetch priority investor CSV from external API and build top-priority set.
+    # If the API is not configured or fetch fails, this will be an empty set and the logic
+    # will fall back to using all AGAINST investors for the top-5 reasons.
+    top_priority_investors: Set[str] = set()
+    if PRIORITY_INVESTOR_CSV_API_URL:
+        try:
+            t0 = time.time()
+            csv_text = await fetch_priority_investor_csv_from_api(PRIORITY_INVESTOR_CSV_API_URL)
+            if csv_text:
+                top_priority_investors = build_top_priority_investor_set_from_csv(csv_text)
+                logger.info(
+                    f"[PRIORITY CSV] Fetched and parsed {len(top_priority_investors)} top-priority investors "
+                    f"from API in {time.time() - t0:.4f}s"
+                )
+            else:
+                logger.warning("[PRIORITY CSV] Failed to fetch CSV from external API, falling back to all investors")
+        except Exception as e:
+            logger.error(f"[PRIORITY CSV] Error fetching CSV from API: {e}")
+    else:
+        logger.info("[PRIORITY CSV] No API URL configured, using all investors for top-5 reasons")
+
     def iter_results():
         meta = {
             "filename": file.filename,
@@ -1011,8 +1116,15 @@ async def analyze_document_stream(
         yield json.dumps({"type": "meta", "data": meta}) + "\n"
 
         t_stream_start = time.time()
-        against_reasons = []
-        relevant_chunks_set: Set[str] = set()  # Collect unique chunks from investors who voted AGAINST
+        # Collect reasons and chunks for investors who voted AGAINST.
+        # We keep both:
+        # - all AGAINST investors
+        # - only AGAINST investors that are in the top 50% of names from the CSV
+        against_reasons_all: List[str] = []
+        against_reasons_top: List[str] = []
+        relevant_chunks_all: Set[str] = set()
+        relevant_chunks_top: Set[str] = set()
+        top_against_investors: Set[str] = set()
         
         for inv in investor_list:
             pol_text = investor_policies[inv]
@@ -1033,8 +1145,13 @@ async def analyze_document_stream(
 
             if base["verdict"] == "AGAINST":
                 # Collect chunks from investors who voted AGAINST for use in top 5 reasons
-                relevant_chunks_set.update(top_chunks)
-                
+                relevant_chunks_all.update(top_chunks)
+
+                is_top_investor = inv in top_priority_investors
+                if is_top_investor:
+                    relevant_chunks_top.update(top_chunks)
+                    top_against_investors.add(inv)
+
                 inv_obj = investor_objects[inv]
                 yield json.dumps({"type": "reason-start", "investor": inv_obj}) + "\n"
                 reason_tokens = []
@@ -1049,25 +1166,47 @@ async def analyze_document_stream(
                     ) + "\n"
                 full_reason = "".join(reason_tokens)
                 yield json.dumps({"type": "reason-end", "investor": inv_obj}) + "\n"
-                
-                against_reasons.append(full_reason)
+
+                # Always track all AGAINST reasons
+                against_reasons_all.append(full_reason)
+                # Additionally track reasons for top-priority investors
+                if is_top_investor:
+                    against_reasons_top.append(full_reason)
 
         logger.info(f"New Changes; Streaming loop finished in {time.time() - t_stream_start:.4f}s")
         
-        # Get top 5 against reasons from ChatGPT
-        if against_reasons:
-            logger.info(f"Starting top 5 reasons generation for {len(against_reasons)} reasons")
-            # Convert set to list and use relevant chunks from AGAINST votes, or fallback to all chunks
-            relevant_chunks_list = list(relevant_chunks_set) if relevant_chunks_set else chunks
-            top_5_reasons = get_top_5_against_reasons(against_reasons, relevant_chunks_list)
+        # Get top 5 AGAINST reasons from ChatGPT.
+        # If at least 2 investors in the top 50% bucket voted AGAINST, we only
+        # use their reasons for the aggregated top-5. Otherwise, we fall back to
+        # using all investors who voted AGAINST (previous behaviour).
+        if against_reasons_all:
+            use_top_bucket = len(top_against_investors) >= 2 and len(against_reasons_top) > 0
+
+            if use_top_bucket:
+                candidate_reasons = against_reasons_top
+                candidate_chunks = list(relevant_chunks_top) if relevant_chunks_top else chunks
+                logger.info(
+                    f"Using TOP-50% investors for top-5 reasons: "
+                    f"{len(top_against_investors)} investors, {len(candidate_reasons)} reasons"
+                )
+            else:
+                candidate_reasons = against_reasons_all
+                candidate_chunks = list(relevant_chunks_all) if relevant_chunks_all else chunks
+                logger.info(
+                    "Falling back to ALL AGAINST investors for top-5 reasons "
+                    f"({len(candidate_reasons)} reasons)"
+                )
+
+            logger.info(f"Starting top 5 reasons generation for {len(candidate_reasons)} reasons")
+            top_5_reasons = get_top_5_against_reasons(candidate_reasons, candidate_chunks)
             if top_5_reasons:
                 logger.info(f"Successfully generated top reasons (count={top_5_reasons.get('count')})")
                 # Output shape: [ { reason1, exp1, ... } ]
-                yield json.dumps({"type": "top-5-against", "data": [top_5_reasons]}) + "\n"
+                yield json.dumps({[top_5_reasons]}) + "\n"
             else:
                 logger.warning("Failed to generate top 5 reasons, falling back to first 5")
                 # Fallback: keep the same structured shape
-                yield json.dumps({"type": "top-5-against", "data": [build_top_5_against_fallback(against_reasons)]}) + "\n"
+                yield json.dumps({[build_top_5_against_fallback(candidate_reasons)]}) + "\n"
         
         logger.info(f"Total streaming request took {time.time() - t_req_start:.4f}s")
         yield json.dumps({"type": "done"}) + "\n"
