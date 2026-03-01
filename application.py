@@ -6,7 +6,7 @@ import sys
 
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 import os
 import html
@@ -19,6 +19,7 @@ import docx
 import re
 from typing import Optional, Set, Dict, List
 import json
+import asyncpg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +56,7 @@ USERNAME = os.getenv("APP_USERNAME", "JayminShah")
 PASSWORD = os.getenv("APP_PASSWORD", "Password1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://cgspherestage:cgsphere123@cg-sphere-global-stag.c9aom6cm8vaq.ap-south-1.rds.amazonaws.com:5432/postgres?sslmode=require")
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 CLS_MODEL_NAME = os.getenv("CLS_MODEL_NAME", "Jaymin123321/Rem-Classifier")
@@ -115,16 +117,33 @@ logger.info(f"FLIP_LABELS: {FLIP_LABELS}")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 logger.info(f"OpenAI client ready: {bool(client)}")
 
-DATA_DIR = "/workspace"
-DF_PATH = os.getenv("POLICY_CSV", f"{DATA_DIR}/investor_rem_policies.csv")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DF_PATH = os.getenv(
+    "POLICY_CSV",
+    os.path.join(BASE_DIR, "investor_rem_policies.csv")
+)
+
 df = pd.read_csv(DF_PATH)
 investor_policies: Dict[str, str] = dict(zip(df["Investor"], df["RemunerationPolicy"]))
 
 CSV_MAP = {
-    "autotrader": os.getenv("AUTOTRADER_CSV", f"{DATA_DIR}/autotrader_against_votes.csv"),
-    "unilever": os.getenv("UNILEVER_CSV", f"{DATA_DIR}/unilever_against_votes.csv"),
-    "sainsbury": os.getenv("SAINSBURY_CSV", f"{DATA_DIR}/sainsbury_against_votes.csv"),
-    "leg": os.getenv("LEG_CSV", f"{DATA_DIR}/leg_against_votes.csv"),
+    "autotrader": os.getenv(
+        "AUTOTRADER_CSV",
+        os.path.join(BASE_DIR, "autotrader_against_votes.csv"),
+    ),
+    "unilever": os.getenv(
+        "UNILEVER_CSV",
+        os.path.join(BASE_DIR, "unilever_against_votes.csv"),
+    ),
+    "sainsbury": os.getenv(
+        "SAINSBURY_CSV",
+        os.path.join(BASE_DIR, "sainsbury_against_votes.csv"),
+    ),
+    "leg": os.getenv(
+        "LEG_CSV",
+        os.path.join(BASE_DIR, "leg_against_votes.csv"),
+    ),
 }
 
 def _tokenize_name(s: str) -> List[str]:
@@ -245,6 +264,30 @@ with torch.no_grad():
         for name, vec in zip(names, vecs):
             INVESTOR_EMBS[name] = vec
 logger.info(f"Cached {len(INVESTOR_EMBS)} investor policies.")
+
+db_pool = None
+
+async def get_db_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    return db_pool
+
+async def fetch_investors_by_ids(investor_ids: List[str]) -> Dict[str, Dict[str, str]]:
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, \"investorName\", \"investorCode\" FROM investor_masters WHERE id = ANY($1::uuid[])",
+            investor_ids
+        )
+    investors = {}
+    for row in rows:
+        investors[str(row['id'])] = {
+            'id': str(row['id']),
+            'investorName': row['investorName'],
+            'investorCode': row['investorCode']
+        }
+    return investors
 
 app = FastAPI()
 
@@ -442,6 +485,141 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
         return response.choices[0].message.content.strip()
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
+
+def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]:
+    """Send all against reasons to ChatGPT and have it select the top 5 most compelling ones."""
+    if client is None or not against_reasons:
+        return None
+    
+    logger.info(f"[TOP5] Processing {len(against_reasons)} reasons")
+    
+     # Always send to GPT to get concise summaries, even if <= 5 reasons
+    
+    # Format all reasons for ChatGPT
+    formatted_reasons = "\n\n".join([f"{i}. {reason}" for i, reason in enumerate(against_reasons, 1)])
+
+    num_reasons_to_return = min(5, len(against_reasons))
+    prompt = (
+        "Below is a list of reasons why investors voted AGAINST a corporate resolution:\n\n"
+        f"{formatted_reasons}\n\n"
+        "TASK:\n"
+        f"Analyze ALL the reasons above and identify the {num_reasons_to_return} most important and compelling concerns that apply across all investors.\n"
+        "Then create a VERY CONCISE summary for each (5-10 words maximum).\n\n"
+        "RULES:\n"
+        "- Each summary MUST be 5-10 words only\n"
+        "- No investor names, no company names\n"
+        "- No explanations or analysis\n"
+        "- Focus on the core concern only\n"
+        "- Make it a standalone statement\n\n"
+        "OUTPUT FORMAT:\n"
+        f"You MUST return ONLY a valid JSON array with exactly {num_reasons_to_return} string elements.\n"
+        "Start your response with [ and end with ].\n"
+        "Do NOT include any text before the opening bracket or after the closing bracket.\n"
+        "Do NOT wrap it in an object.\n"
+        "Do NOT include markdown code blocks.\n"
+        "Do NOT include explanations.\n\n"
+        f"Example format (copy this structure exactly):\n"
+        '["Misaligned executive pay structure", "Poor performance linkage", "Excessive discretionary bonuses", "Weak disclosure transparency", "Short-term incentive focus"]\n\n'
+        "Your response should start with [ and contain only the JSON array."
+    )
+    
+    try:
+        t0 = time.time()
+        # Don't use JSON mode since we need an array, not an object
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are an expert in corporate governance. You MUST respond with ONLY a valid JSON array. Start with [ and end with ]. No other text, no explanations, no markdown, no code blocks."
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        
+        logger.info(f"GPT top-5 selection took {time.time() - t0:.2f}s")
+        
+        content = response.choices[0].message.content.strip()
+        logger.info(f"[TOP5] Raw GPT response (first 500 chars): {content[:500]}")
+        
+        # Clean up content - remove markdown code blocks if present
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
+            if content.startswith("json"):
+                content = content[4:].strip()
+            logger.info(f"[TOP5] After removing markdown: {content[:500]}")
+        
+        # Try multiple strategies to extract the JSON array
+        
+        # Strategy 1: Try parsing the content directly
+        parsed = None
+        try:
+            parsed = json.loads(content)
+            logger.info(f"[TOP5] Direct parse succeeded, type: {type(parsed)}")
+        except json.JSONDecodeError as e:
+            logger.info(f"[TOP5] Direct parse failed: {e}")
+            
+            # Strategy 2: Try to find JSON array using balanced bracket matching
+            bracket_count = 0
+            start_idx = -1
+            for i, char in enumerate(content):
+                if char == '[':
+                    if bracket_count == 0:
+                        start_idx = i
+                    bracket_count += 1
+                elif char == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0 and start_idx != -1:
+                        # Found a complete array
+                        array_content = content[start_idx:i+1]
+                        logger.info(f"[TOP5] Extracted array using bracket matching: {array_content[:200]}")
+                        try:
+                            parsed = json.loads(array_content)
+                            logger.info(f"[TOP5] Bracket-matched parse succeeded")
+                            break
+                        except json.JSONDecodeError as e2:
+                            logger.info(f"[TOP5] Bracket-matched parse failed: {e2}")
+                            continue
+            
+            # Strategy 3: Try regex to find array (more lenient)
+            if parsed is None:
+                # Match from first [ to last ] (greedy)
+                array_match = re.search(r'\[.*\]', content, re.DOTALL)
+                if array_match:
+                    array_content = array_match.group(0)
+                    logger.info(f"[TOP5] Extracted array using regex: {array_content[:200]}")
+                    try:
+                        parsed = json.loads(array_content)
+                        logger.info(f"[TOP5] Regex-matched parse succeeded")
+                    except json.JSONDecodeError as e3:
+                        logger.info(f"[TOP5] Regex-matched parse failed: {e3}")
+        
+        # Process the parsed result
+        if parsed is None:
+            logger.error(f"[TOP5] All parsing strategies failed. Full content: {content}")
+            return None
+
+        # If it's wrapped in an object, try to find an array
+        if isinstance(parsed, dict):
+            # Look for common keys that might contain the array
+            for key in ["reasons", "top_5", "results", "data", "items", "top5", "reasons_list"]:
+                if key in parsed and isinstance(parsed[key], list):
+                    result = parsed[key][:5]
+                    logger.info(f"[TOP5] Found array in dict key '{key}', returning {len(result)} items")
+                    return result
+            logger.warning(f"[TOP5] Found dict but no array key. Keys: {list(parsed.keys())}")
+            return None
+        elif isinstance(parsed, list):
+            result = parsed[:5]  # Ensure max 5
+            logger.info(f"[TOP5] Found direct array with {len(parsed)} items, returning {len(result)} items")
+            return result
+        else:
+            logger.warning(f"[TOP5] Parsed JSON is neither dict nor list: {type(parsed)}, value: {parsed}")
+            return None
+    except Exception as e:
+        logger.error(f"Error getting top 5 from GPT: {e}")
+        return None
 
 def stream_gpt_reason(policy_text: str, chunks: List[str]):
     if client is None:
@@ -709,25 +887,27 @@ async def analyze_document_stream(
         elif filename.endswith(".pdf"):
             full_text = extract_text_from_pdf_bytes(contents)
         else:
-            return {
-                "error": f"Unsupported file type: {filename}. Please upload .docx or .pdf.",
-            }
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Unsupported file type: {filename}. Please upload .docx or .pdf."}
+            )
         logger.info(f"Text extraction took {time.time() - t0:.4f}s")
     except Exception as e:
         logger.error(f"Error extracting text: {e}")
-        return {
-            "error": f"Error extracting text: {str(e)}",
-        }
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Error extracting text: {str(e)}"}
+        )
 
     if not full_text.strip():
-        return {"error": "No readable text found in document."}
+        return JSONResponse(status_code=400, content={"error": "No readable text found in document."})
 
     t0 = time.time()
     chunks = chunk_text(full_text)
     logger.info(f"Chunking took {time.time() - t0:.4f}s, created {len(chunks)} chunks")
 
     if not chunks:
-        return {"error": "Document is too short to chunk."}
+        return JSONResponse(status_code=400, content={"error": "Document is too short to chunk."})
 
     original_num_chunks = len(chunks)
     if len(chunks) > MAX_CHUNKS:
@@ -737,32 +917,63 @@ async def analyze_document_stream(
     chunk_embeddings = get_embeddings(chunks, batch_size=32)
     logger.info(f"Embedding generation took {time.time() - t0:.4f}s")
 
+    investor_list = []
+    investor_objects = {}
+
     if not policies or policies.lower() == "all":
         investor_list = list(investor_policies.keys())
+        for inv_name in investor_list:
+            investor_objects[inv_name] = {
+                'id': None,
+                'investorName': inv_name,
+                'investorCode': None
+            }
     else:
-        requested_raw = [p.strip() for p in policies.split("@") if p.strip()]
-
-        normalized_map = {normalize_name(k): k for k in investor_policies.keys()}
-
-        investor_list = []
-        unknown = []
-
-        for req in requested_raw:
-            key = normalize_name(req)
-
-            if key in normalized_map:
-                investor_list.append(normalized_map[key])
-                continue
-
-            matches = [full for norm, full in normalized_map.items() if norm.startswith(key)]
-            if matches:
-                investor_list.append(matches[0])
-                continue
-
-            unknown.append(req)
-
-        if unknown:
-            return {"error": f"Unknown investor(s): {', '.join(unknown)}"}
+        requested_ids = [p.strip() for p in policies.split("@") if p.strip()]
+        
+        try:
+            t0 = time.time()
+            db_investors = await fetch_investors_by_ids(requested_ids)
+            logger.info(f"Database fetch took {time.time() - t0:.4f}s")
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "investor not found"}
+            )
+        
+        missing_ids = [inv_id for inv_id in requested_ids if inv_id not in db_investors]
+        if missing_ids:
+            logger.warning(f"Investors not found in database: {missing_ids}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "investor not found"}
+            )
+        
+        normalized_policy_map = {normalize_name(k): k for k in investor_policies.keys()}
+        
+        for inv_id, inv_data in db_investors.items():
+            inv_name = inv_data['investorName']
+            normalized_inv_name = normalize_name(inv_name)
+            
+            matched_policy_name = None
+            if normalized_inv_name in normalized_policy_map:
+                matched_policy_name = normalized_policy_map[normalized_inv_name]
+            else:
+                for norm_policy, policy_name in normalized_policy_map.items():
+                    if normalized_inv_name in norm_policy or norm_policy in normalized_inv_name:
+                        matched_policy_name = policy_name
+                        break
+            
+            if not matched_policy_name:
+                logger.warning(f"Investor '{inv_name}' from database does not match any policy")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "investor not found"}
+                )
+            
+            investor_list.append(matched_policy_name)
+            investor_objects[matched_policy_name] = inv_data
 
     def iter_results():
         meta = {
@@ -771,11 +982,13 @@ async def analyze_document_stream(
             "num_chunks_used": len(chunks),
             "max_chunks_cap": MAX_CHUNKS,
             "policies": policies,
-            "investors": investor_list,
+            "investors": [investor_objects[inv] for inv in investor_list],
         }
         yield json.dumps({"type": "meta", "data": meta}) + "\n"
 
         t_stream_start = time.time()
+        against_reasons = []
+        
         for inv in investor_list:
             pol_text = investor_policies[inv]
             force_reason = inv in csv_force_reason_investors
@@ -789,22 +1002,42 @@ async def analyze_document_stream(
             )
 
             data_without_reason = dict(base)
+            data_without_reason["investor"] = investor_objects[inv]
             data_without_reason["reason"] = None
             yield json.dumps({"type": "result", "data": data_without_reason}) + "\n"
 
             if base["verdict"] == "AGAINST":
-                yield json.dumps({"type": "reason-start", "investor": inv}) + "\n"
+                inv_obj = investor_objects[inv]
+                yield json.dumps({"type": "reason-start", "investor": inv_obj}) + "\n"
+                reason_tokens = []
                 for token in stream_gpt_reason(pol_text, top_chunks):
+                    reason_tokens.append(token)
                     yield json.dumps(
                         {
                             "type": "reason-chunk",
-                            "investor": inv,
+                            "investor": inv_obj,
                             "token": token,
                         }
                     ) + "\n"
-                yield json.dumps({"type": "reason-end", "investor": inv}) + "\n"
+                full_reason = "".join(reason_tokens)
+                yield json.dumps({"type": "reason-end", "investor": inv_obj}) + "\n"
+                
+                against_reasons.append(full_reason)
 
-        logger.info(f"Streaming loop finished in {time.time() - t_stream_start:.4f}s")
+        logger.info(f"New Changes; Streaming loop finished in {time.time() - t_stream_start:.4f}s")
+        
+        # Get top 5 against reasons from ChatGPT
+        if against_reasons:
+            logger.info(f"Starting top 5 reasons generation for {len(against_reasons)} reasons")
+            top_5_reasons = get_top_5_against_reasons(against_reasons)
+            if top_5_reasons:
+                logger.info(f"Successfully generated {len(top_5_reasons)} top reasons")
+                yield json.dumps({"type": "top-5-against", "data": top_5_reasons}) + "\n"
+            else:
+                logger.warning("Failed to generate top 5 reasons, falling back to first 5")
+                # Fallback: if GPT fails, just return first 5
+                yield json.dumps({"type": "top-5-against", "data": against_reasons[:5]}) + "\n"
+        
         logger.info(f"Total streaming request took {time.time() - t_req_start:.4f}s")
         yield json.dumps({"type": "done"}) + "\n"
 
