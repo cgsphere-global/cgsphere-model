@@ -132,55 +132,78 @@ DF_PATH = os.getenv(
 
 df = pd.read_csv(DF_PATH)
 investor_policies: Dict[str, str] = dict(zip(df["Investor"], df["RemunerationPolicy"]))
-def _parse_priority_investor_names_from_csv_text(csv_text: str) -> List[str]:
+def parse_investor_shares_from_csv_text(csv_text: str) -> Dict[str, float]:
     """
-    Parse a CSV (provided as text) containing investor names and return
-    them in order. This is intended for CSVs fetched from an external API,
-    not from local files.
+    Parse CSV text containing at minimum:
+    - an investor name column
+    - a numeric "shares held" column (e.g., "shares", "shares held", "number of shares held")
 
-    Strategy:
-    - Try to read as a full CSV with pandas
-    - Prefer the first object-typed column as the name column
-    - Fallback to the first column if necessary
-    - If pandas fails, fall back to treating each non-empty line as a name
+    Returns a mapping of normalized investor name -> shares (float).
     """
     text = (csv_text or "").strip()
     if not text:
-        return []
+        return {}
 
     try:
-        df_pri = pd.read_csv(StringIO(text))
-        if df_pri.empty:
-            return []
+        df_csv = pd.read_csv(StringIO(text))
+    except Exception as e:
+        logger.warning(f"[PRIORITY CSV] Failed to parse CSV: {e}")
+        return {}
 
-        # Prefer any object-typed column as the name column
-        name_col = None
-        for col in df_pri.columns:
-            if df_pri[col].dtype == object:
+    if df_csv.empty:
+        return {}
+
+    lower = {str(c).lower(): c for c in df_csv.columns}
+
+    # Name column: prefer explicit headers, then first object-typed column, then first column.
+    name_col = None
+    for cand in ["investor", "investor name", "name", "manager", "fund manager"]:
+        if cand in lower:
+            name_col = lower[cand]
+            break
+    if name_col is None:
+        for col in df_csv.columns:
+            if df_csv[col].dtype == object:
                 name_col = col
                 break
+    if name_col is None:
+        name_col = df_csv.columns[0]
 
-        if name_col is None:
-            name_col = df_pri.columns[0]
+    # Shares column: prefer headers containing 'share' or 'holding', else first numeric column.
+    shares_col = None
+    for col in df_csv.columns:
+        col_lower = str(col).lower()
+        if ("share" in col_lower) or ("holding" in col_lower):
+            shares_col = col
+            break
+    if shares_col is None:
+        for col in df_csv.columns:
+            if pd.api.types.is_numeric_dtype(df_csv[col]):
+                shares_col = col
+                break
 
-        return df_pri[name_col].dropna().astype(str).tolist()
-    except Exception:
-        # Fallback: one investor name per non-empty line
-        return [line.strip() for line in text.splitlines() if line.strip()]
+    if shares_col is None:
+        logger.warning("[PRIORITY CSV] No shares column detected in CSV")
+        return {}
 
+    names = df_csv[name_col].astype(str)
+    shares = pd.to_numeric(df_csv[shares_col], errors="coerce")
 
-def build_top_priority_investor_set_from_csv(csv_text: str, fraction: float = 0.5) -> Set[str]:
-    """
-    Given CSV text of investor names (from an external API), build a set of
-    the top-N names, where N is `fraction` of the list length (default 50%),
-    with a minimum of 1 if any names are present.
-    """
-    names = _parse_priority_investor_names_from_csv_text(csv_text)
-    if not names:
-        return set()
+    out: Dict[str, float] = {}
+    for raw_name, raw_shares in zip(names.tolist(), shares.tolist()):
+        if raw_name is None:
+            continue
+        if raw_shares is None or (isinstance(raw_shares, float) and np.isnan(raw_shares)):
+            continue
+        norm = normalize_name(str(raw_name))
+        if not norm:
+            continue
+        try:
+            out[norm] = float(raw_shares)
+        except Exception:
+            continue
 
-    cutoff = max(1, int(len(names) * fraction))
-    return set(names[:cutoff])
+    return out
 
 
 async def fetch_priority_investor_csv_from_api(api_url: str, timeout: float = 10.0) -> Optional[str]:
@@ -1083,26 +1106,25 @@ async def analyze_document_stream(
             investor_list.append(matched_policy_name)
             investor_objects[matched_policy_name] = inv_data
 
-    # Automatically fetch priority investor CSV from external API and build top-priority set.
-    # If the API is not configured or fetch fails, this will be an empty set and the logic
-    # will fall back to using all AGAINST investors for the top-5 reasons.
-    top_priority_investors: Set[str] = set()
+    # Automatically fetch investor shareholdings CSV from external API.
+    # We will only use AGAINST investors that can be matched to this CSV.
+    priority_investor_shares: Dict[str, float] = {}
     if PRIORITY_INVESTOR_CSV_API_URL:
         try:
             t0 = time.time()
             csv_text = await fetch_priority_investor_csv_from_api(PRIORITY_INVESTOR_CSV_API_URL)
             if csv_text:
-                top_priority_investors = build_top_priority_investor_set_from_csv(csv_text)
+                priority_investor_shares = parse_investor_shares_from_csv_text(csv_text)
                 logger.info(
-                    f"[PRIORITY CSV] Fetched and parsed {len(top_priority_investors)} top-priority investors "
+                    f"[PRIORITY CSV] Fetched and parsed shares for {len(priority_investor_shares)} investors "
                     f"from API in {time.time() - t0:.4f}s"
                 )
             else:
-                logger.warning("[PRIORITY CSV] Failed to fetch CSV from external API, falling back to all investors")
+                logger.warning("[PRIORITY CSV] Failed to fetch CSV from external API, top-5 reasons will be skipped")
         except Exception as e:
             logger.error(f"[PRIORITY CSV] Error fetching CSV from API: {e}")
     else:
-        logger.info("[PRIORITY CSV] No API URL configured, using all investors for top-5 reasons")
+        logger.info("[PRIORITY CSV] No API URL configured, top-5 reasons will be skipped")
 
     def iter_results():
         meta = {
@@ -1117,14 +1139,9 @@ async def analyze_document_stream(
 
         t_stream_start = time.time()
         # Collect reasons and chunks for investors who voted AGAINST.
-        # We keep both:
-        # - all AGAINST investors
-        # - only AGAINST investors that are in the top 50% of names from the CSV
-        against_reasons_all: List[str] = []
-        against_reasons_top: List[str] = []
-        relevant_chunks_all: Set[str] = set()
-        relevant_chunks_top: Set[str] = set()
-        top_against_investors: Set[str] = set()
+        # We will later filter AGAINST investors by shareholdings CSV and select
+        # the top 50% (>= median shares) within that matched subset.
+        against_matched: List[Dict[str, object]] = []
         
         for inv in investor_list:
             pol_text = investor_policies[inv]
@@ -1144,13 +1161,8 @@ async def analyze_document_stream(
             yield json.dumps({"type": "result", "data": data_without_reason}) + "\n"
 
             if base["verdict"] == "AGAINST":
-                # Collect chunks from investors who voted AGAINST for use in top 5 reasons
-                relevant_chunks_all.update(top_chunks)
-
-                is_top_investor = inv in top_priority_investors
-                if is_top_investor:
-                    relevant_chunks_top.update(top_chunks)
-                    top_against_investors.add(inv)
+                shares = priority_investor_shares.get(normalize_name(inv))
+                has_shares = shares is not None
 
                 inv_obj = investor_objects[inv]
                 yield json.dumps({"type": "reason-start", "investor": inv_obj}) + "\n"
@@ -1167,46 +1179,48 @@ async def analyze_document_stream(
                 full_reason = "".join(reason_tokens)
                 yield json.dumps({"type": "reason-end", "investor": inv_obj}) + "\n"
 
-                # Always track all AGAINST reasons
-                against_reasons_all.append(full_reason)
-                # Additionally track reasons for top-priority investors
-                if is_top_investor:
-                    against_reasons_top.append(full_reason)
+                # Track AGAINST investors that matched the CSV (for later median calc)
+                if has_shares:
+                    against_matched.append(
+                        {
+                            "investor": inv,
+                            "shares": float(shares),
+                            "reason": full_reason,
+                            "chunks": top_chunks,
+                        }
+                    )
 
         logger.info(f"New Changes; Streaming loop finished in {time.time() - t_stream_start:.4f}s")
         
-        # Get top 5 AGAINST reasons from ChatGPT.
-        # If at least 2 investors in the top 50% bucket voted AGAINST, we only
-        # use their reasons for the aggregated top-5. Otherwise, we fall back to
-        # using all investors who voted AGAINST (previous behaviour).
-        if against_reasons_all:
-            use_top_bucket = len(top_against_investors) >= 2 and len(against_reasons_top) > 0
+        # Get top 5 AGAINST reasons from ChatGPT based ONLY on investors matched to the CSV.
+        if against_matched:
+            shares_list = [cast(float, x["shares"]) for x in against_matched]
+            median_shares = float(pd.Series(shares_list).quantile(0.5))
 
-            if use_top_bucket:
-                candidate_reasons = against_reasons_top
-                candidate_chunks = list(relevant_chunks_top) if relevant_chunks_top else chunks
-                logger.info(
-                    f"Using TOP-50% investors for top-5 reasons: "
-                    f"{len(top_against_investors)} investors, {len(candidate_reasons)} reasons"
-                )
-            else:
-                candidate_reasons = against_reasons_all
-                candidate_chunks = list(relevant_chunks_all) if relevant_chunks_all else chunks
-                logger.info(
-                    "Falling back to ALL AGAINST investors for top-5 reasons "
-                    f"({len(candidate_reasons)} reasons)"
-                )
+            top_bucket = [x for x in against_matched if cast(float, x["shares"]) >= median_shares]
+            candidate_reasons = [cast(str, x["reason"]) for x in top_bucket if cast(str, x["reason"])]
+            candidate_chunks_set: Set[str] = set()
+            for x in top_bucket:
+                candidate_chunks_set.update(cast(List[str], x["chunks"]))
+            candidate_chunks = list(candidate_chunks_set) if candidate_chunks_set else chunks
 
-            logger.info(f"Starting top 5 reasons generation for {len(candidate_reasons)} reasons")
-            top_5_reasons = get_top_5_against_reasons(candidate_reasons, candidate_chunks)
-            if top_5_reasons:
-                logger.info(f"Successfully generated top reasons (count={top_5_reasons.get('count')})")
-                # Output shape: [ { reason1, exp1, ... } ]
-                yield json.dumps({[top_5_reasons]}) + "\n"
-            else:
-                logger.warning("Failed to generate top 5 reasons, falling back to first 5")
-                # Fallback: keep the same structured shape
-                yield json.dumps({[build_top_5_against_fallback(candidate_reasons)]}) + "\n"
+            logger.info(
+                f"Using AGAINST investors >= median shares for top-5 reasons: "
+                f"{len(top_bucket)} investors, {len(candidate_reasons)} reasons (median={median_shares:.2f})"
+            )
+
+            if candidate_reasons:
+                logger.info(f"Starting top 5 reasons generation for {len(candidate_reasons)} reasons")
+                top_5_reasons = get_top_5_against_reasons(candidate_reasons, candidate_chunks)
+                if top_5_reasons:
+                    logger.info(f"Successfully generated top reasons (count={top_5_reasons.get('count')})")
+                    yield json.dumps({[top_5_reasons]}) + "\n"
+                else:
+                    logger.warning("Failed to generate top 5 reasons, falling back to first 5")
+                    fallback_payload = build_top_5_against_fallback(candidate_reasons)
+                    yield json.dumps({[fallback_payload]}) + "\n"
+        else:
+            logger.info("No AGAINST investors matched the CSV with shares; skipping top-5 reasons")
         
         logger.info(f"Total streaming request took {time.time() - t_req_start:.4f}s")
         yield json.dumps({"type": "done"}) + "\n"
