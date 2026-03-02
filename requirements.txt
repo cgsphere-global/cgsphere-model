@@ -19,3 +19,4 @@ accelerate
 python-multipart
 scikit-learn
 asyncpg
+httpx

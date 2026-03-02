@@ -10,16 +10,20 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 import os
 import html
-from io import BytesIO
+from io import BytesIO, StringIO
 import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from openai import OpenAI
 import docx
 import re
-from typing import Optional, Set, Dict, List
+from typing import Optional, Set, Dict, List, TypedDict, cast
 import json
 import asyncpg
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +61,8 @@ PASSWORD = os.getenv("APP_PASSWORD", "Password1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://cgspherestage:cgsphere123@cg-sphere-global-stag.c9aom6cm8vaq.ap-south-1.rds.amazonaws.com:5432/postgres?sslmode=require")
+# External API endpoint for fetching priority investor CSV
+PRIORITY_INVESTOR_CSV_API_URL = os.getenv("PRIORITY_INVESTOR_CSV_API_URL", "")
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 CLS_MODEL_NAME = os.getenv("CLS_MODEL_NAME", "Jaymin123321/Rem-Classifier")
@@ -126,6 +132,97 @@ DF_PATH = os.getenv(
 
 df = pd.read_csv(DF_PATH)
 investor_policies: Dict[str, str] = dict(zip(df["Investor"], df["RemunerationPolicy"]))
+def parse_investor_shares_from_csv_text(csv_text: str) -> Dict[str, float]:
+    """
+    Parse CSV text containing at minimum:
+    - an investor name column
+    - a numeric "shares held" column (e.g., "shares", "shares held", "number of shares held")
+
+    Returns a mapping of normalized investor name -> shares (float).
+    """
+    text = (csv_text or "").strip()
+    if not text:
+        return {}
+
+    try:
+        df_csv = pd.read_csv(StringIO(text))
+    except Exception as e:
+        logger.warning(f"[PRIORITY CSV] Failed to parse CSV: {e}")
+        return {}
+
+    if df_csv.empty:
+        return {}
+
+    lower = {str(c).lower(): c for c in df_csv.columns}
+
+    # Name column: prefer explicit headers, then first object-typed column, then first column.
+    name_col = None
+    for cand in ["investor", "investor name", "name", "manager", "fund manager"]:
+        if cand in lower:
+            name_col = lower[cand]
+            break
+    if name_col is None:
+        for col in df_csv.columns:
+            if df_csv[col].dtype == object:
+                name_col = col
+                break
+    if name_col is None:
+        name_col = df_csv.columns[0]
+
+    # Shares column: prefer headers containing 'share' or 'holding', else first numeric column.
+    shares_col = None
+    for col in df_csv.columns:
+        col_lower = str(col).lower()
+        if ("share" in col_lower) or ("holding" in col_lower):
+            shares_col = col
+            break
+    if shares_col is None:
+        for col in df_csv.columns:
+            if pd.api.types.is_numeric_dtype(df_csv[col]):
+                shares_col = col
+                break
+
+    if shares_col is None:
+        logger.warning("[PRIORITY CSV] No shares column detected in CSV")
+        return {}
+
+    names = df_csv[name_col].astype(str)
+    shares = pd.to_numeric(df_csv[shares_col], errors="coerce")
+
+    out: Dict[str, float] = {}
+    for raw_name, raw_shares in zip(names.tolist(), shares.tolist()):
+        if raw_name is None:
+            continue
+        if raw_shares is None or (isinstance(raw_shares, float) and np.isnan(raw_shares)):
+            continue
+        norm = normalize_name(str(raw_name))
+        if not norm:
+            continue
+        try:
+            out[norm] = float(raw_shares)
+        except Exception:
+            continue
+
+    return out
+
+
+async def fetch_priority_investor_csv_from_api(api_url: str, timeout: float = 10.0) -> Optional[str]:
+    """
+    Fetch CSV text from an external API endpoint. Returns the CSV text as a string,
+    or None if the fetch fails or httpx is not available.
+    """
+    if not api_url or not httpx:
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(api_url)
+            response.raise_for_status()
+            return response.text
+    except Exception as e:
+        logger.warning(f"Failed to fetch priority investor CSV from {api_url}: {e}")
+        return None
+
 
 CSV_MAP = {
     "autotrader": os.getenv(
@@ -379,24 +476,34 @@ def predict_votes_batch(policy: str, chunks: List[str], max_length: int = 512):
     if not chunks:
         return []
 
-    p = cls_tokenizer(policy, truncation=True, max_length=max_length // 2, add_special_tokens=False)
-    policy_ids = p["input_ids"]
-
     all_input_ids = []
     all_token_type_ids = []
     all_attention_masks = []
 
     for chunk in chunks:
-        c = cls_tokenizer(chunk, truncation=True, max_length=max_length // 2, add_special_tokens=False)
+        # Encode the (policy, chunk) pair directly. This is more robust across
+        # different tokenizer implementations than calling
+        # `build_inputs_with_special_tokens` manually, which may not be present.
+        encoded = cls_tokenizer(
+            policy,
+            chunk,
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+        )
 
-        ids = cls_tokenizer.build_inputs_with_special_tokens(policy_ids, c["input_ids"])
-        token_type_ids = cls_tokenizer.create_token_type_ids_from_sequences(policy_ids, c["input_ids"])
+        ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+
+        # Some models/tokenizers may not provide token_type_ids; fall back to zeros.
+        token_type_ids = encoded.get("token_type_ids")
+        if token_type_ids is None:
+            token_type_ids = [0] * len(ids)
 
         if len(ids) > max_length:
             ids = ids[:max_length]
             token_type_ids = token_type_ids[:max_length]
-
-        attention_mask = [1] * len(ids)
+            attention_mask = attention_mask[:max_length]
 
         all_input_ids.append(ids)
         all_token_type_ids.append(token_type_ids)
@@ -486,137 +593,161 @@ def get_gpt_reason(policy_text: str, chunks: List[str]):
     except Exception as e:
         return f"(GPT error: {html.escape(str(e))})"
 
-def get_top_5_against_reasons(against_reasons: List[str]) -> Optional[List[str]]:
-    """Send all against reasons to ChatGPT and have it select the top 5 most compelling ones."""
+class Top5AgainstOutput(TypedDict):
+    count: int
+    reason1: str
+    exp1: str
+    reason2: str
+    exp2: str
+    reason3: str
+    exp3: str
+    reason4: str
+    exp4: str
+    reason5: str
+    exp5: str
+
+
+def build_top_5_against_fallback(against_reasons: List[str]) -> Top5AgainstOutput:
+    """Fallback builder when GPT is unavailable/fails.
+
+    Produces the same structured shape as Structured Outputs, using truncation heuristics.
+    """
+
+    def _clean(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip())
+
+    def _reason_short(s: str) -> str:
+        words = _clean(s).split(" ")
+        words = [w for w in words if w]
+        return " ".join(words[:10])[:120]
+
+    def _exp_short(s: str) -> str:
+        # Keep it readable, but bounded
+        return _clean(s)[:280]
+
+    count = min(5, len(against_reasons))
+    out: Top5AgainstOutput = {
+        "count": max(1, count) if against_reasons else 1,
+        "reason1": "",
+        "exp1": "",
+        "reason2": "",
+        "exp2": "",
+        "reason3": "",
+        "exp3": "",
+        "reason4": "",
+        "exp4": "",
+        "reason5": "",
+        "exp5": "",
+    }
+    for i in range(1, count + 1):
+        txt = against_reasons[i - 1]
+        out[f"reason{i}"] = _reason_short(txt)  # type: ignore[literal-required]
+        out[f"exp{i}"] = _exp_short(txt)  # type: ignore[literal-required]
+    return out
+
+
+def get_top_5_against_reasons(against_reasons: List[str], chunks: List[str]) -> Optional[Top5AgainstOutput]:
+    """Summarize investor AGAINST rationales into up to 5 concise reasons + short explanations.
+
+    Uses OpenAI Structured Outputs (JSON schema) to avoid brittle JSON parsing.
+    Includes specific references from the annual report in the explanations.
+    """
     if client is None or not against_reasons:
         return None
     
-    logger.info(f"[TOP5] Processing {len(against_reasons)} reasons")
+    logger.info(f"[TOP5] Processing {len(against_reasons)} reasons with {len(chunks)} report chunks")
     
-     # Always send to GPT to get concise summaries, even if <= 5 reasons
+    # Always send to GPT to get concise summaries, even if <= 5 reasons
     
     # Format all reasons for ChatGPT
     formatted_reasons = "\n\n".join([f"{i}. {reason}" for i, reason in enumerate(against_reasons, 1)])
+    
+    # Format relevant chunks from the annual report (limit to TOP_K to avoid token limits)
+    formatted_chunks = "\n\n".join([f"[Report Excerpt {i+1}]:\n{chunk}" for i, chunk in enumerate(chunks[:TOP_K])])
 
     num_reasons_to_return = min(5, len(against_reasons))
     prompt = (
         "Below is a list of reasons why investors voted AGAINST a corporate resolution:\n\n"
         f"{formatted_reasons}\n\n"
+        "RELEVANT EXCERPTS FROM THE COMPANY'S ANNUAL REPORT:\n\n"
+        f"{formatted_chunks}\n\n"
         "TASK:\n"
-        f"Analyze ALL the reasons above and identify the {num_reasons_to_return} most important and compelling concerns that apply across all investors.\n"
-        "Then create a VERY CONCISE summary for each (5-10 words maximum).\n\n"
+        f"- Identify the top {num_reasons_to_return} most important, cross-cutting concerns.\n"
+        "- For each, write:\n"
+        "  - a short reason (5–10 words)\n"
+        "  - a short explanation (1–2 sentences) that INCLUDES SPECIFIC DETAILS from the annual report excerpts above\n\n"
         "RULES:\n"
-        "- Each summary MUST be 5-10 words only\n"
         "- No investor names, no company names\n"
-        "- No explanations or analysis\n"
-        "- Focus on the core concern only\n"
-        "- Make it a standalone statement\n\n"
-        "OUTPUT FORMAT:\n"
-        f"You MUST return ONLY a valid JSON array with exactly {num_reasons_to_return} string elements.\n"
-        "Start your response with [ and end with ].\n"
-        "Do NOT include any text before the opening bracket or after the closing bracket.\n"
-        "Do NOT wrap it in an object.\n"
-        "Do NOT include markdown code blocks.\n"
-        "Do NOT include explanations.\n\n"
-        f"Example format (copy this structure exactly):\n"
-        '["Misaligned executive pay structure", "Poor performance linkage", "Excessive discretionary bonuses", "Weak disclosure transparency", "Short-term incentive focus"]\n\n'
-        "Your response should start with [ and contain only the JSON array."
+        "- Reasons must be standalone and non-overlapping\n"
+        "- Explanations MUST include specific facts, figures, or details from the annual report excerpts\n"
+        "- Reference specific report excerpts when possible (e.g., 'The report shows...', 'According to the disclosure...')\n"
+        "- If fewer than 5 reasons are warranted, set count accordingly and leave the remaining reason/exp fields as empty strings.\n"
     )
+
+    schema = {
+        "name": "top_5_against_reasons",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "count": {"type": "integer", "minimum": 1, "maximum": 5},
+                "reason1": {"type": "string"},
+                "exp1": {"type": "string"},
+                "reason2": {"type": "string"},
+                "exp2": {"type": "string"},
+                "reason3": {"type": "string"},
+                "exp3": {"type": "string"},
+                "reason4": {"type": "string"},
+                "exp4": {"type": "string"},
+                "reason5": {"type": "string"},
+                "exp5": {"type": "string"},
+            },
+            "required": [
+                "count",
+                "reason1",
+                "exp1",
+                "reason2",
+                "exp2",
+                "reason3",
+                "exp3",
+                "reason4",
+                "exp4",
+                "reason5",
+                "exp5",
+            ],
+        },
+    }
     
     try:
         t0 = time.time()
-        # Don't use JSON mode since we need an array, not an object
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are an expert in corporate governance. You MUST respond with ONLY a valid JSON array. Start with [ and end with ]. No other text, no explanations, no markdown, no code blocks."
+                    "content": "You are an expert in corporate governance and ESG voting."
                 },
                 {"role": "user", "content": prompt},
             ],
+            response_format={"type": "json_schema", "json_schema": schema},
+            temperature=0.2,
         )
         
         logger.info(f"GPT top-5 selection took {time.time() - t0:.2f}s")
         
-        content = response.choices[0].message.content.strip()
-        logger.info(f"[TOP5] Raw GPT response (first 500 chars): {content[:500]}")
-        
-        # Clean up content - remove markdown code blocks if present
-        if content.startswith("```"):
-            lines = content.split("\n")
-            content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
-            if content.startswith("json"):
-                content = content[4:].strip()
-            logger.info(f"[TOP5] After removing markdown: {content[:500]}")
-        
-        # Try multiple strategies to extract the JSON array
-        
-        # Strategy 1: Try parsing the content directly
-        parsed = None
-        try:
-            parsed = json.loads(content)
-            logger.info(f"[TOP5] Direct parse succeeded, type: {type(parsed)}")
-        except json.JSONDecodeError as e:
-            logger.info(f"[TOP5] Direct parse failed: {e}")
-            
-            # Strategy 2: Try to find JSON array using balanced bracket matching
-            bracket_count = 0
-            start_idx = -1
-            for i, char in enumerate(content):
-                if char == '[':
-                    if bracket_count == 0:
-                        start_idx = i
-                    bracket_count += 1
-                elif char == ']':
-                    bracket_count -= 1
-                    if bracket_count == 0 and start_idx != -1:
-                        # Found a complete array
-                        array_content = content[start_idx:i+1]
-                        logger.info(f"[TOP5] Extracted array using bracket matching: {array_content[:200]}")
-                        try:
-                            parsed = json.loads(array_content)
-                            logger.info(f"[TOP5] Bracket-matched parse succeeded")
-                            break
-                        except json.JSONDecodeError as e2:
-                            logger.info(f"[TOP5] Bracket-matched parse failed: {e2}")
-                            continue
-            
-            # Strategy 3: Try regex to find array (more lenient)
-            if parsed is None:
-                # Match from first [ to last ] (greedy)
-                array_match = re.search(r'\[.*\]', content, re.DOTALL)
-                if array_match:
-                    array_content = array_match.group(0)
-                    logger.info(f"[TOP5] Extracted array using regex: {array_content[:200]}")
-                    try:
-                        parsed = json.loads(array_content)
-                        logger.info(f"[TOP5] Regex-matched parse succeeded")
-                    except json.JSONDecodeError as e3:
-                        logger.info(f"[TOP5] Regex-matched parse failed: {e3}")
-        
-        # Process the parsed result
-        if parsed is None:
-            logger.error(f"[TOP5] All parsing strategies failed. Full content: {content}")
+        content = (response.choices[0].message.content or "").strip()
+        logger.info(f"[TOP5] Structured output (first 500 chars): {content[:500]}")
+
+        parsed = cast(Top5AgainstOutput, json.loads(content))
+
+        # Minimal sanity check (schema should already enforce this)
+        count = int(parsed.get("count", 0))
+        if count < 1 or count > 5:
+            logger.warning(f"[TOP5] Invalid count returned: {count}")
             return None
 
-        # If it's wrapped in an object, try to find an array
-        if isinstance(parsed, dict):
-            # Look for common keys that might contain the array
-            for key in ["reasons", "top_5", "results", "data", "items", "top5", "reasons_list"]:
-                if key in parsed and isinstance(parsed[key], list):
-                    result = parsed[key][:5]
-                    logger.info(f"[TOP5] Found array in dict key '{key}', returning {len(result)} items")
-                    return result
-            logger.warning(f"[TOP5] Found dict but no array key. Keys: {list(parsed.keys())}")
-            return None
-        elif isinstance(parsed, list):
-            result = parsed[:5]  # Ensure max 5
-            logger.info(f"[TOP5] Found direct array with {len(parsed)} items, returning {len(result)} items")
-            return result
-        else:
-            logger.warning(f"[TOP5] Parsed JSON is neither dict nor list: {type(parsed)}, value: {parsed}")
-            return None
+        return parsed
     except Exception as e:
         logger.error(f"Error getting top 5 from GPT: {e}")
         return None
@@ -975,6 +1106,26 @@ async def analyze_document_stream(
             investor_list.append(matched_policy_name)
             investor_objects[matched_policy_name] = inv_data
 
+    # Automatically fetch investor shareholdings CSV from external API.
+    # We will only use AGAINST investors that can be matched to this CSV.
+    priority_investor_shares: Dict[str, float] = {}
+    if PRIORITY_INVESTOR_CSV_API_URL:
+        try:
+            t0 = time.time()
+            csv_text = await fetch_priority_investor_csv_from_api(PRIORITY_INVESTOR_CSV_API_URL)
+            if csv_text:
+                priority_investor_shares = parse_investor_shares_from_csv_text(csv_text)
+                logger.info(
+                    f"[PRIORITY CSV] Fetched and parsed shares for {len(priority_investor_shares)} investors "
+                    f"from API in {time.time() - t0:.4f}s"
+                )
+            else:
+                logger.warning("[PRIORITY CSV] Failed to fetch CSV from external API, top-5 reasons will be skipped")
+        except Exception as e:
+            logger.error(f"[PRIORITY CSV] Error fetching CSV from API: {e}")
+    else:
+        logger.info("[PRIORITY CSV] No API URL configured, top-5 reasons will be skipped")
+
     def iter_results():
         meta = {
             "filename": file.filename,
@@ -987,7 +1138,10 @@ async def analyze_document_stream(
         yield json.dumps({"type": "meta", "data": meta}) + "\n"
 
         t_stream_start = time.time()
-        against_reasons = []
+        # Collect reasons and chunks for investors who voted AGAINST.
+        # We will later filter AGAINST investors by shareholdings CSV and select
+        # the top 50% (>= median shares) within that matched subset.
+        against_matched: List[Dict[str, object]] = []
         
         for inv in investor_list:
             pol_text = investor_policies[inv]
@@ -1007,6 +1161,9 @@ async def analyze_document_stream(
             yield json.dumps({"type": "result", "data": data_without_reason}) + "\n"
 
             if base["verdict"] == "AGAINST":
+                shares = priority_investor_shares.get(normalize_name(inv))
+                has_shares = shares is not None
+
                 inv_obj = investor_objects[inv]
                 yield json.dumps({"type": "reason-start", "investor": inv_obj}) + "\n"
                 reason_tokens = []
@@ -1021,22 +1178,49 @@ async def analyze_document_stream(
                     ) + "\n"
                 full_reason = "".join(reason_tokens)
                 yield json.dumps({"type": "reason-end", "investor": inv_obj}) + "\n"
-                
-                against_reasons.append(full_reason)
+
+                # Track AGAINST investors that matched the CSV (for later median calc)
+                if has_shares:
+                    against_matched.append(
+                        {
+                            "investor": inv,
+                            "shares": float(shares),
+                            "reason": full_reason,
+                            "chunks": top_chunks,
+                        }
+                    )
 
         logger.info(f"New Changes; Streaming loop finished in {time.time() - t_stream_start:.4f}s")
         
-        # Get top 5 against reasons from ChatGPT
-        if against_reasons:
-            logger.info(f"Starting top 5 reasons generation for {len(against_reasons)} reasons")
-            top_5_reasons = get_top_5_against_reasons(against_reasons)
-            if top_5_reasons:
-                logger.info(f"Successfully generated {len(top_5_reasons)} top reasons")
-                yield json.dumps({"type": "top-5-against", "data": top_5_reasons}) + "\n"
-            else:
-                logger.warning("Failed to generate top 5 reasons, falling back to first 5")
-                # Fallback: if GPT fails, just return first 5
-                yield json.dumps({"type": "top-5-against", "data": against_reasons[:5]}) + "\n"
+        # Get top 5 AGAINST reasons from ChatGPT based ONLY on investors matched to the CSV.
+        if against_matched:
+            shares_list = [cast(float, x["shares"]) for x in against_matched]
+            median_shares = float(pd.Series(shares_list).quantile(0.5))
+
+            top_bucket = [x for x in against_matched if cast(float, x["shares"]) >= median_shares]
+            candidate_reasons = [cast(str, x["reason"]) for x in top_bucket if cast(str, x["reason"])]
+            candidate_chunks_set: Set[str] = set()
+            for x in top_bucket:
+                candidate_chunks_set.update(cast(List[str], x["chunks"]))
+            candidate_chunks = list(candidate_chunks_set) if candidate_chunks_set else chunks
+
+            logger.info(
+                f"Using AGAINST investors >= median shares for top-5 reasons: "
+                f"{len(top_bucket)} investors, {len(candidate_reasons)} reasons (median={median_shares:.2f})"
+            )
+
+            if candidate_reasons:
+                logger.info(f"Starting top 5 reasons generation for {len(candidate_reasons)} reasons")
+                top_5_reasons = get_top_5_against_reasons(candidate_reasons, candidate_chunks)
+                if top_5_reasons:
+                    logger.info(f"Successfully generated top reasons (count={top_5_reasons.get('count')})")
+                    yield json.dumps({[top_5_reasons]}) + "\n"
+                else:
+                    logger.warning("Failed to generate top 5 reasons, falling back to first 5")
+                    fallback_payload = build_top_5_against_fallback(candidate_reasons)
+                    yield json.dumps({[fallback_payload]}) + "\n"
+        else:
+            logger.info("No AGAINST investors matched the CSV with shares; skipping top-5 reasons")
         
         logger.info(f"Total streaming request took {time.time() - t_req_start:.4f}s")
         yield json.dumps({"type": "done"}) + "\n"
