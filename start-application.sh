@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+export $(grep -v '^#' .env | xargs)
 
 APP_NAME="cgsphere-model"
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
